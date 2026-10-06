@@ -52,9 +52,9 @@ class OpenJevClient:
         transport: Callable | None = None,
     ) -> None:
         self.base_url = str(base_url or os.getenv("HERMES_REFLEX_OPENJEV_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        if not self.base_url.startswith(("http://127.0.0.1", "http://localhost", "https://")):
+        if not self.base_url.startswith(("http://127.0.0.1", "http://localhost", "https://", "http://192.168.", "http://10.", "http://172.")):
             raise OpenJevError(
-                "OpenJev helper must use loopback HTTP or HTTPS. For a remote GPU, SSH-forward the helper port "
+                "OpenJev helper must use loopback HTTP, private LAN, or HTTPS. For a remote GPU, SSH-forward the helper port "
                 "or terminate TLS before configuring a non-loopback endpoint."
             )
         self.model = str(model or os.getenv("HERMES_REFLEX_OPENJEV_MODEL") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
