@@ -138,6 +138,17 @@ class ProgressIntegrityQolTests(unittest.TestCase):
                 tool_call_id="test", session_id="s1", turn_id="t1",
             )
             self.assertEqual(system.status(turn_id="t1")["verified_test_passes"], 1)
+
+            # Hermes terminal tool returns a JSON string with "error": null on success
+            system.observe_tool_call(
+                tool_name="terminal",
+                args={"command": "npm test"},
+                status="ok",
+                result='{"output": "Test Files 1 passed (1)\\nTests 5 passed (5)", "exit_code": 0, "error": null}',
+                error_message="",
+                tool_call_id="test2", session_id="s1", turn_id="t1",
+            )
+            self.assertEqual(system.status(turn_id="t1")["verified_test_passes"], 2)
             self.assertIsNone(system.completion_gate(
                 turn_id="t1", session_id="s1", final_response="Done",
                 coding=True, changed_paths=["src/parser.py"],

@@ -6,6 +6,7 @@ with task-relative progress.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import PurePosixPath
 from typing import Any
@@ -173,8 +174,36 @@ def changed_paths_relevant(changed_paths: list[str] | tuple[str, ...], requested
 def test_succeeded(status: str, result: str = "", error_message: str = "") -> bool:
     if str(status or "").strip().lower() not in {"ok", "success", "passed", "pass"}:
         return False
-    text = f"{result} {error_message}".lower()
-    return not any(token in text for token in ("failed", "failure", "error", "traceback"))
+    if error_message and str(error_message).strip():
+        return False
+    output_text = str(result or "")
+    parsed = None
+    if isinstance(result, str):
+        stripped = result.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]")):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                parsed = None
+    elif isinstance(result, dict):
+        parsed = result
+
+    if isinstance(parsed, dict):
+        if parsed.get("error"):
+            return False
+        exit_code = parsed.get("exit_code")
+        if exit_code is not None:
+            try:
+                if int(exit_code) != 0:
+                    return False
+            except (ValueError, TypeError):
+                return False
+        output_text = str(parsed.get("output", "") or "")
+
+    text = output_text.lower()
+    if "0 failed" in text:
+        text = text.replace("0 failed", "")
+    return not any(token in text for token in ("failed", "failure", "traceback"))
 
 
 def _normalize_path(value: str) -> str:
