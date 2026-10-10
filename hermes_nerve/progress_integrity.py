@@ -57,23 +57,34 @@ INTAKE_INVOCATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+SYSTEM_DELIVERY_RE = re.compile(
+    r'^(?:\[IMPORTANT:\s*Background process\b|Nerve completion integrity check:\b|\[System\b|\[The user reacted\b)',
+    re.IGNORECASE,
+)
+
 
 def change_required(user_message: str) -> bool:
-    msg = str(user_message or "")
-    if INTAKE_INVOCATION_RE.search(msg):
+    msg = str(user_message or "").strip()
+    if INTAKE_INVOCATION_RE.search(msg) or SYSTEM_DELIVERY_RE.search(msg):
         return False
     return bool(CHANGE_REQUIRED_RE.search(msg))
 
 
 def verification_required(user_message: str) -> bool:
-    return bool(VERIFY_REQUIRED_RE.search(str(user_message or "")))
+    msg = str(user_message or "").strip()
+    if SYSTEM_DELIVERY_RE.search(msg):
+        return False
+    return bool(VERIFY_REQUIRED_RE.search(msg))
 
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp"})
 
 def requested_paths(user_message: str) -> tuple[str, ...]:
+    msg = str(user_message or "").strip()
+    if SYSTEM_DELIVERY_RE.search(msg):
+        return ()
     seen: list[str] = []
-    cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", str(user_message or ""))
+    cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", msg)
     for raw in PATH_RE.findall(cleaned):
         path = _normalize_path(raw)
         if path and not any(path.lower().endswith(ext) for ext in IMAGE_EXTENSIONS) and path not in seen:
