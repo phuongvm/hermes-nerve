@@ -225,7 +225,8 @@ def test_succeeded(status: str, result: str = "", error_message: str = "") -> bo
     text = output_text.lower()
     if "0 failed" in text:
         text = text.replace("0 failed", "")
-    return not any(token in text for token in ("failed", "failure", "traceback"))
+    text = re.sub(r"enable tracemalloc to get the object allocation traceback", "", text)
+    return not any(token in text for token in ("failed", "failure", "traceback (most recent call last):"))
 
 
 def _normalize_path(value: str) -> str:
