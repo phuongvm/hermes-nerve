@@ -19,7 +19,7 @@ TOOL_ALIASES: dict[str, frozenset[str]] = {
     "mutation": frozenset({
         "write_file", "edit_file", "patch", "patch_file", "apply_patch", "replace_file",
         "create_file", "delete_file", "move_file", "rename_file", "fs_write", "fs_replace",
-        "write", "edit",
+        "write", "edit", "kanban_create", "kanban_link", "kanban_complete",
     }),
     "read": frozenset({"read_file", "fs_read", "cat", "open_file"}),
     "search": frozenset({"search_text", "fs_search", "grep", "find", "list_files", "fs_list"}),
@@ -52,20 +52,31 @@ SCRATCH_NAMES = {
     "repro.py", "scratch.py", "tmp.py", "test_repro.py", "debug.py", "experiment.py",
 }
 
+INTAKE_INVOCATION_RE = re.compile(
+    r'(?:\[IMPORTANT: The user has invoked the "(?:crew|crew-no-spec)" skill\b|^\s*/crew(?:-no-spec)?\b)',
+    re.IGNORECASE,
+)
+
 
 def change_required(user_message: str) -> bool:
-    return bool(CHANGE_REQUIRED_RE.search(str(user_message or "")))
+    msg = str(user_message or "")
+    if INTAKE_INVOCATION_RE.search(msg):
+        return False
+    return bool(CHANGE_REQUIRED_RE.search(msg))
 
 
 def verification_required(user_message: str) -> bool:
     return bool(VERIFY_REQUIRED_RE.search(str(user_message or "")))
 
 
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp"})
+
 def requested_paths(user_message: str) -> tuple[str, ...]:
     seen: list[str] = []
-    for raw in PATH_RE.findall(str(user_message or "")):
+    cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", str(user_message or ""))
+    for raw in PATH_RE.findall(cleaned):
         path = _normalize_path(raw)
-        if path and path not in seen:
+        if path and not any(path.lower().endswith(ext) for ext in IMAGE_EXTENSIONS) and path not in seen:
             seen.append(path)
     return tuple(seen[:32])
 
