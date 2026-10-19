@@ -85,7 +85,11 @@ def requested_paths(user_message: str) -> tuple[str, ...]:
         return ()
     seen: list[str] = []
     cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", msg)
+    cleaned = re.sub(r"@?url:[^\s]+", "", cleaned)
+    cleaned = re.sub(r"https?://[^\s`]+", "", cleaned)
     for raw in PATH_RE.findall(cleaned):
+        if re.match(r"^\d+(?:\.\d+)+$", raw):
+            continue
         path = _normalize_path(raw)
         if path and not any(path.lower().endswith(ext) for ext in IMAGE_EXTENSIONS) and path not in seen:
             seen.append(path)

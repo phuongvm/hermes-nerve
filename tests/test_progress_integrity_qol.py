@@ -31,6 +31,12 @@ class ProgressIntegrityQolTests(unittest.TestCase):
             )
         )
 
+    def test_urls_and_metrics_not_treated_as_requested_paths(self):
+        msg = "Update monitor: buzz_platform 378.5 ms https://buzz.ptdev.vip/ and @url:https://honcho-api.ptdev.vip/health"
+        targets = requested_paths(msg)
+        self.assertEqual(targets, ())
+        self.assertTrue(mutation_is_relevant("patch", {"path": "scripts/watchdog_htop.py"}, targets))
+
     def test_scratch_mutation_does_not_clear_progress_stall(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {
             "HERMES_NERVE_NERVOUS_EVENTS": str(Path(td) / "nervous.jsonl"),
