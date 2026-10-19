@@ -84,9 +84,9 @@ def requested_paths(user_message: str) -> tuple[str, ...]:
     if SYSTEM_DELIVERY_RE.search(msg):
         return ()
     seen: list[str] = []
-    cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", msg)
-    cleaned = re.sub(r"@?url:[^\s]+", "", cleaned)
-    cleaned = re.sub(r"https?://[^\s`]+", "", cleaned)
+    cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", msg, flags=re.IGNORECASE)
+    cleaned = re.sub(r"@?url:[^\s]+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"https?://[^\s`]+", "", cleaned, flags=re.IGNORECASE)
     for raw in PATH_RE.findall(cleaned):
         if re.match(r"^\d+(?:\.\d+)+$", raw):
             continue
