@@ -22,11 +22,21 @@ class ProgressIntegrityQolTests(unittest.TestCase):
 
     def test_native_patch_is_central_mutation_alias(self):
         self.assertEqual(tool_kind("patch", {"patch": "*** Begin Patch\n*** End Patch"}), "mutation")
+        self.assertEqual(tool_kind("default_api:patch", {"patch": "*** Begin Patch\n*** End Patch"}), "mutation")
+        self.assertEqual(tool_kind("default_api:write_file", {"path": "src/parser.py"}), "mutation")
+        self.assertEqual(tool_kind("default_api:terminal", {"command": "python -m unittest"}), "test")
         targets = requested_paths("Fix src/parser.py")
         self.assertTrue(
             mutation_is_relevant(
                 "patch",
-                {"patch": "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1 +1 @@\n-a\n+b"},
+                {"patch": "*** Begin Patch\n*** End Patch", "path": "src/parser.py"},
+                targets,
+            )
+        )
+        self.assertTrue(
+            mutation_is_relevant(
+                "default_api:patch",
+                {"path": "src/parser.py"},
                 targets,
             )
         )

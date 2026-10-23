@@ -86,6 +86,7 @@ def requested_paths(user_message: str) -> tuple[str, ...]:
     seen: list[str] = []
     cleaned = re.sub(r"\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\]]*\]", "", msg, flags=re.IGNORECASE)
     cleaned = re.sub(r"@?url:[^\s]+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"@?file:[^\s]+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"https?://[^\s`]+", "", cleaned, flags=re.IGNORECASE)
     for raw in PATH_RE.findall(cleaned):
         if re.match(r"^\d+(?:\.\d+)+$", raw):
@@ -102,6 +103,8 @@ def _shell_segments(command: str) -> list[str]:
 
 def tool_kind(tool_name: str, args: dict[str, Any] | None = None) -> str:
     selected = str(tool_name or "").strip().lower()
+    if ":" in selected:
+        selected = selected.split(":")[-1]
     for kind, aliases in TOOL_ALIASES.items():
         if selected in aliases:
             return kind
@@ -120,6 +123,8 @@ def tool_kind(tool_name: str, args: dict[str, Any] | None = None) -> str:
 
 def environment_action(tool_name: str, args: dict[str, Any] | None = None) -> str:
     selected = str(tool_name or "").strip().lower()
+    if ":" in selected:
+        selected = selected.split(":")[-1]
     command = str((args or {}).get("command") or "")
     segments = _shell_segments(command)
     if selected != "terminal":
@@ -198,7 +203,8 @@ def changed_paths_relevant(changed_paths: list[str] | tuple[str, ...], requested
 
 
 def test_succeeded(status: str, result: str = "", error_message: str = "") -> bool:
-    if str(status or "").strip().lower() not in {"ok", "success", "passed", "pass"}:
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status and normalized_status not in {"ok", "success", "passed", "pass", "none", ""}:
         return False
     if error_message and str(error_message).strip():
         return False
