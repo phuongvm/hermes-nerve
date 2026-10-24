@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from hermes_nerve import nervous
 from hermes_nerve.progress_integrity import (
+    change_required,
     mutation_is_relevant,
     requested_paths,
     tool_kind,
@@ -61,6 +62,36 @@ class ProgressIntegrityQolTests(unittest.TestCase):
         for msg, expected in cases:
             with self.subTest(msg=msg):
                 self.assertEqual(requested_paths(msg), expected)
+
+    def test_negated_change_phrases_do_not_require_change(self):
+        negated = [
+            "Please do not fix anything, just explain the failure.",
+            "Let us not fix this yet; investigate first.",
+            "let's not fix it today",
+            "Don't fix the parser.",
+            "don\u2019t fix it, only report",
+            "Do NOT modify or patch any files.",
+            "We should not update, edit, or refactor this module.",
+            "Never implement this without approval.",
+            "Do not really fix it.",
+            "No need to fix it; summarize the issue.",
+            "This is not an issue to fix right now? No, do not fix it.",
+        ]
+        for msg in negated:
+            with self.subTest(msg=msg):
+                self.assertFalse(change_required(msg))
+        positive = [
+            "Fix src/parser.py",
+            "Do not fix the parser, but update the docs.",
+            "Not now, but please fix the bug.",
+            "Don't just report it, fix it.",
+            "Notify me, then fix the regression.",
+            "If not fixed, implement a workaround.",
+            "Not only fix the bug but also add tests.",
+        ]
+        for msg in positive:
+            with self.subTest(msg=msg):
+                self.assertTrue(change_required(msg))
 
     def test_scratch_mutation_does_not_clear_progress_stall(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {

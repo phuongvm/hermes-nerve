@@ -12,6 +12,22 @@ from pathlib import PurePosixPath
 from typing import Any
 
 CHANGE_REQUIRED_RE = re.compile(r"\b(?:fix|implement|modify|patch|repair|refactor|edit|update)\b", re.IGNORECASE)
+_CHANGE_VERBS = r"(?:fix|implement|modify|patch|repair|refactor|edit|update)"
+# A change verb directly governed by a negation ("do not fix", "let us not fix",
+# "don't fix", "never implement", "no need to fix", "not an issue to fix") is not
+# a change request. Coordinated verbs ("not update, edit, or refactor") share the
+# negation; a contrast ("do not fix X, but update Y") ends it, so Y still counts.
+NEGATED_CHANGE_RE = re.compile(
+    r"(?:\bnot\s+(?:an?\s+|the\s+)?(?:issue|problem|bug)s?\s+to"
+    r"|\bno\s+need\s+to"
+    r"|\b(?:dont|doesnt|didnt|shouldnt|mustnt|wont|cant|cannot)"
+    r"|n['\u2019]t"
+    r"|\bnot|\bnever)"
+    r"\s+(?:(?:to|be|ever|yet|even|try\s+to|attempt\s+to|(?!only\b)[a-z]+ly)\s+)*"
+    rf"\b{_CHANGE_VERBS}\b"
+    rf"(?:\s*,\s*(?:(?:or|and|nor)\s+)?{_CHANGE_VERBS}\b|\s+(?:or|and|nor)\s+{_CHANGE_VERBS}\b)*",
+    re.IGNORECASE,
+)
 VERIFY_REQUIRED_RE = re.compile(r"\b(?:test|tests|verify|verification|regression|check)\b", re.IGNORECASE)
 PATH_RE = re.compile(r"(?<![\w.-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]{1,12})(?![\w.-])")
 
@@ -67,7 +83,7 @@ def change_required(user_message: str) -> bool:
     msg = str(user_message or "").strip()
     if INTAKE_INVOCATION_RE.search(msg) or SYSTEM_DELIVERY_RE.search(msg):
         return False
-    return bool(CHANGE_REQUIRED_RE.search(msg))
+    return bool(CHANGE_REQUIRED_RE.search(NEGATED_CHANGE_RE.sub(" ", msg)))
 
 
 def verification_required(user_message: str) -> bool:
