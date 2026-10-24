@@ -1,10 +1,12 @@
 """Dependency-free HTTP client for a self-hosted OpenJev /v1/systemone helper."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -18,6 +20,42 @@ DEFAULT_TIMEOUT = 10.0
 
 class OpenJevError(RuntimeError):
     pass
+
+
+# RFC 1918 private-use IPv4 blocks; plaintext HTTP is admitted only for these and loopback.
+RFC1918_NETWORKS = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+)
+
+
+def _endpoint_allowed(base_url: str) -> bool:
+    """Return True for HTTPS, or plaintext HTTP to loopback / an RFC 1918 IPv4 address.
+
+    The host is parsed (not prefix-matched), so ``http://172.32.0.1`` or
+    ``http://10.evil.example`` cannot pass as a private-LAN endpoint.
+    """
+    try:
+        parts = urllib.parse.urlsplit(base_url)
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    host = parts.hostname or ""
+    if scheme == "https":
+        return bool(host)
+    if scheme != "http" or not host or parts.username is not None or parts.password is not None:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if addr.version == 6:
+        return addr == ipaddress.IPv6Address("::1")
+    return addr.is_loopback or any(addr in net for net in RFC1918_NETWORKS)
 
 
 @dataclass(frozen=True)
@@ -52,7 +90,7 @@ class OpenJevClient:
         transport: Callable | None = None,
     ) -> None:
         self.base_url = str(base_url or os.getenv("HERMES_REFLEX_OPENJEV_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        if not self.base_url.startswith(("http://127.0.0.1", "http://localhost", "https://", "http://192.168.", "http://10.", "http://172.")):
+        if not _endpoint_allowed(self.base_url):
             raise OpenJevError(
                 "OpenJev helper must use loopback HTTP, private LAN, or HTTPS. For a remote GPU, SSH-forward the helper port "
                 "or terminate TLS before configuring a non-loopback endpoint."

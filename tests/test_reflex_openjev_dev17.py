@@ -108,6 +108,63 @@ class OpenJevDev17Tests(unittest.TestCase):
     def test_plaintext_non_loopback_rejected(self):
         with self.assertRaises(OpenJevError): OpenJevClient(base_url="http://192.0.2.9:3000")
 
+    def test_plaintext_rfc1918_and_loopback_endpoints_accepted(self):
+        # NERVE-INV-1: plaintext HTTP only for loopback or RFC 1918 (10/8, 172.16/12, 192.168/16).
+        for url in (
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1",
+            "http://localhost:3000",
+            "http://LOCALHOST:3000/",
+            "http://[::1]:3000",
+            "http://10.0.0.0:3000",
+            "http://10.255.255.255:3000",
+            "http://172.16.0.0:3000",
+            "http://172.16.0.1:3000",
+            "http://172.31.255.255:3000",
+            "http://192.168.0.1:3000",
+            "http://192.168.100.110:3000",
+            "http://192.168.255.255:3000",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(OpenJevClient(base_url=url).base_url, url.rstrip("/"))
+
+    def test_plaintext_outside_rfc1918_rejected(self):
+        # NERVE-INV-1 boundaries: 172.15/172.32 sit just outside 172.16.0.0/12; 172.217 is public.
+        for url in (
+            "http://172.15.255.255:3000",
+            "http://172.32.0.1:3000",
+            "http://172.217.0.1:3000",
+            "http://172.0.0.1:3000",
+            "http://11.0.0.1:3000",
+            "http://9.255.255.255:3000",
+            "http://192.167.255.255:3000",
+            "http://192.169.0.1:3000",
+            "http://192.0.2.9:3000",
+            "http://100.64.0.1:3000",
+            "http://169.254.1.1:3000",
+            "http://8.8.8.8:3000",
+            "http://example.com:3000",
+            # Prefix-spoofing hostnames and userinfo must not pass as private/loopback.
+            "http://10.evil.example:3000",
+            "http://192.168.example.com:3000",
+            "http://127.0.0.1.nip.io:3000",
+            "http://localhost.evil.example:3000",
+            "http://10.0.0.1@evil.example:3000",
+            "http://10.1:3000",
+            "http://[fc00::1]:3000",
+            "http://[::ffff:10.0.0.1]:3000",
+            "http:///nohost",
+            "ftp://10.0.0.1:3000",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(OpenJevError):
+                    OpenJevClient(base_url=url)
+
+    def test_https_endpoints_still_accepted(self):
+        for url in ("https://openjev.example.com", "https://172.217.0.1:3000", "https://8.8.8.8"):
+            with self.subTest(url=url):
+                self.assertEqual(OpenJevClient(base_url=url).base_url, url)
+
     def test_openjev_decision_is_local_only(self):
         def transport(url,headers,body,timeout):
             labels=list(json.loads(body)["questions"]["decision"]["criteria"])
