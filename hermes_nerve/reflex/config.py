@@ -1,6 +1,7 @@
 """Global Reflex backend configuration used by DecisionEngine default construction."""
 from __future__ import annotations
 
+import hashlib
 import threading
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from .shadow import ShadowProvider
 from . import telemetry
 
 _LOCK = threading.RLock()
+_SIDECAR_SIG: tuple[str, str] | None = None
 _SETTINGS: dict[str, Any] = {
     "backend": "jev",
     "laya_base_url": LAYA_BASE_URL,
@@ -28,6 +30,61 @@ _SETTINGS: dict[str, Any] = {
     "shadow_async": True,
     "shadow_log": "",
 }
+
+
+def _current_sidecar_sig() -> tuple[str, str] | None:
+    try:
+        from ..profiles import profile_path
+        path = profile_path()
+        raw = path.read_bytes()
+        return (str(path), hashlib.sha256(raw).hexdigest())
+    except Exception:
+        return None
+
+
+def _sync_sidecar_if_changed() -> None:
+    global _SIDECAR_SIG
+    sig = _current_sidecar_sig()
+    if sig is None or sig == _SIDECAR_SIG:
+        return
+    try:
+        from ..profiles import load_profile
+        doc = load_profile()
+    except Exception:
+        return
+    with _LOCK:
+        _SIDECAR_SIG = sig
+        if not isinstance(doc, dict):
+            return
+        adv = doc.get("advanced")
+        if not isinstance(adv, dict):
+            return
+        if "reflex_backend" in adv and str(adv["reflex_backend"] or "").strip().lower() in {"jev", "laya", "openjev", "shadow"}:
+            _SETTINGS["backend"] = str(adv["reflex_backend"]).strip().lower()
+        for src, dst in (
+            ("reflex_laya_base_url", "laya_base_url"),
+            ("reflex_laya_model", "laya_model"),
+            ("reflex_laya_token", "laya_token"),
+            ("reflex_openjev_base_url", "openjev_base_url"),
+            ("reflex_openjev_model", "openjev_model"),
+            ("reflex_openjev_token", "openjev_token"),
+            ("reflex_openjev_expected_identity", "openjev_expected_identity"),
+        ):
+            if src in adv and adv[src] is not None:
+                val = str(adv[src]).strip()
+                if dst.endswith("_base_url"):
+                    val = val.rstrip("/")
+                if val or dst.endswith("_token") or dst.endswith("_identity"):
+                    _SETTINGS[dst] = val
+        for src, dst in (
+            ("reflex_laya_timeout_seconds", "laya_timeout_seconds"),
+            ("reflex_openjev_timeout_seconds", "openjev_timeout_seconds"),
+        ):
+            if src in adv and adv[src] is not None:
+                try:
+                    _SETTINGS[dst] = min(120.0, max(0.25, float(adv[src])))
+                except (TypeError, ValueError):
+                    pass
 
 
 def configure(
@@ -46,6 +103,7 @@ def configure(
     shadow_async: Any = True,
     shadow_log: Any = "",
 ) -> None:
+    global _SIDECAR_SIG
     selected = str(backend or "jev").strip().lower()
     if selected not in {"jev", "laya", "openjev", "shadow"}:
         raise ValueError("reflex backend must be one of: jev, laya, openjev, shadow")
@@ -78,9 +136,11 @@ def configure(
                 "shadow_log": str(shadow_log or "").strip(),
             }
         )
+        _SIDECAR_SIG = _current_sidecar_sig()
 
 
 def settings() -> dict[str, Any]:
+    _sync_sidecar_if_changed()
     with _LOCK:
         out = dict(_SETTINGS)
     for name in ("laya_token", "openjev_token"):
@@ -89,6 +149,7 @@ def settings() -> dict[str, Any]:
 
 
 def _raw_settings() -> dict[str, Any]:
+    _sync_sidecar_if_changed()
     with _LOCK:
         return dict(_SETTINGS)
 

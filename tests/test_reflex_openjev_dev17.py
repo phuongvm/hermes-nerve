@@ -199,4 +199,38 @@ class OpenJevDev17Tests(unittest.TestCase):
         p.system_one(state="x",questions={"decision":{"type":"choice","instructions":"x","criteria":{"WATCH":"w","REPLAN":"r"}}})
         r=shadow_report(path,recent_limit=1); self.assertEqual(r["records"],1); self.assertEqual(r["disagreements"],1); self.assertEqual(r["shadow_errors"],0)
 
+    def test_sidecar_profile_hot_reloads_openjev_model_without_restart(self):
+        from hermes_nerve.profiles import save_profile
+        save_profile({
+            "version": 1,
+            "nerve_profile": "fat_cat",
+            "nerve_modules": {},
+            "advanced": {
+                "reflex_backend": "openjev",
+                "reflex_openjev_base_url": "http://192.168.100.110:20128",
+                "reflex_openjev_model": "laya/laya-auto",
+            },
+        })
+        reflex_config.configure(
+            backend="openjev",
+            openjev_base_url="http://192.168.100.110:20128",
+            openjev_model="laya/laya-auto",
+        )
+        self.assertEqual(reflex_config.get_provider().model, "laya/laya-auto")
+        save_profile({
+            "version": 1,
+            "nerve_profile": "fat_cat",
+            "nerve_modules": {},
+            "advanced": {
+                "reflex_backend": "openjev",
+                "reflex_openjev_base_url": "http://192.168.100.110:20128",
+                "reflex_openjev_model": "ollaya/pplx-decider:flash-fp16",
+            },
+        })
+        provider = reflex_config.get_provider()
+        self.assertIsInstance(provider, OpenJevClient)
+        self.assertEqual(provider.model, "ollaya/pplx-decider:flash-fp16")
+        self.assertEqual(reflex_config.settings()["openjev_model"], "ollaya/pplx-decider:flash-fp16")
+
+
 if __name__ == "__main__": unittest.main()
