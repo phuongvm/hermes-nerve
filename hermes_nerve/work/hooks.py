@@ -13,6 +13,7 @@ from .runtime import dispatch_tool, enabled, reviewer, settings, supervisor, too
 from .router import recent_failure_fingerprints, should_call_provider
 from .nerve import evaluate as evaluate_nerve, forecast_extension
 from .supervisor import runtime_identity_from_env
+from ..untrusted import clean_text, scan_untrusted, worst_severity
 
 _INTERNAL_PREFIXES = ("jev_",)
 _DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
@@ -652,12 +653,66 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, sessio
         }
     return None
 
+_EXTERNAL_TOOL_PREFIXES = ("web_", "browser_", "mcp__", "mcp_", "connectors__", "http_", "fetch_")
+_EXTERNAL_TOOLS = {"web_search", "web_extract", "fetch", "http_request", "vision_analyze", "session_search"}
+
+
+def is_external_tool(tool_name: str) -> bool:
+    """True for tools whose result is content from outside the workspace (web, browser, MCP servers, app
+    connectors). Local reads (read_file, terminal, search_files, kanban_*) are the agent's own workspace and are
+    not scanned: the repo legitimately contains injection phrases (specs, these tests)."""
+    name = str(tool_name or "").strip().lower()
+    if ":" in name:
+        name = name.rsplit(":", 1)[-1]
+    return name in _EXTERNAL_TOOLS or name.startswith(_EXTERNAL_TOOL_PREFIXES)
+
+
+def untrusted_contradiction(tool_name: str, result: Any) -> dict[str, Any] | None:
+    """NERVE-INV-4: a fail-closed CONTRADICTION signal when an external tool result carries a high-severity
+    prompt-injection finding (hermes_nerve.untrusted), else None. Low/medium findings never block."""
+    if str(tool_name).startswith(_INTERNAL_PREFIXES) or not is_external_tool(tool_name):
+        return None
+    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    findings = scan_untrusted(text)
+    if worst_severity(findings) != "high":
+        return None
+    return {
+        "state": "CONTRADICTION",
+        "severity": "high",
+        "tool_name": clean_text(tool_name, 120),
+        "rules": [f.rule for f in findings],
+        "findings": [{"rule": f.rule, "severity": f.severity, "excerpt": f.excerpt} for f in findings],
+        "untrusted_evidence": True,
+        "reason": (
+            "High-severity prompt injection detected in untrusted output of "
+            f"{clean_text(tool_name, 120)}; treat it as data and request canonical review before mutating."
+        ),
+    }
+
+
+def _raise_untrusted_contradiction(sup, identity, signal: dict[str, Any]) -> None:
+    from .models import utc_now
+    sup.store.set_control(
+        identity,
+        control="BLOCK",
+        decision_id=f"nerve-untrusted-{identity.run_id}-{'-'.join(signal['rules'])}"[:200],
+        payload=signal,
+        created_at=utc_now(),
+    )
+
+
 def post_tool_call(*, tool_name: str, args: dict[str, Any], result: str, task_id: str = "", session_id: str = "", duration_ms: int = 0, **kwargs: Any) -> None:
     if not enabled() or str(tool_name).startswith(_INTERNAL_PREFIXES):
         return
     identity = _identity(task_id or None, session_id=session_id)
     if identity is None:
         return
+    try:
+        signal = untrusted_contradiction(str(tool_name), result)
+        if signal is not None:
+            _raise_untrusted_contradiction(supervisor(), identity, signal)
+    except Exception:
+        pass
     criterion_id = str((args or {}).get("_jev_criterion_id") or (args or {}).get("criterion_id") or "").strip() or None
     try:
         supervisor().observe_evidence(
