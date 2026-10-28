@@ -603,7 +603,7 @@ _FAIL_WORD_RE = re.compile(
 )
 
 
-def test_succeeded(status: str, result: str = "", error_message: str = "") -> bool:
+def test_succeeded(status: str, result: Any = "", error_message: str = "") -> bool:
     normalized_status = str(status or "").strip().lower()
     if normalized_status and normalized_status not in {"ok", "success", "passed", "pass", "none", ""}:
         return False
@@ -613,11 +613,16 @@ def test_succeeded(status: str, result: str = "", error_message: str = "") -> bo
     # literal `error: null` is not a test failure, but a nonzero exit or an
     # actual transport error must never count as successful verification.
     envelope = result if isinstance(result, dict) else None
-    if envelope is None:
+    if envelope is None and isinstance(result, (str, bytes, bytearray)):
         try:
             envelope = json.loads(result)
         except (ValueError, TypeError):
-            envelope = None
+            try:
+                import ast
+                parsed = ast.literal_eval(result) if isinstance(result, str) and result.strip().startswith("{") else None
+                envelope = parsed if isinstance(parsed, dict) else None
+            except (ValueError, SyntaxError, TypeError):
+                envelope = None
     if isinstance(envelope, dict) and ("exit_code" in envelope or "error" in envelope or "output" in envelope):
         if envelope.get("error"):
             return False
@@ -658,10 +663,12 @@ def _same_or_related(path: str, target: str) -> bool:
     # Suffix matches are only trusted when the longer path is absolute (e.g. a
     # sandbox prefix). A relative decoy such as "evil/app/calc.py" must not
     # count as work on "app/calc.py".
+    def _is_abs(p: str) -> bool:
+        return p.startswith("/") or (len(p) > 2 and p[1] == ":" and p[2] in ("/", "\\"))
     if a.endswith("/" + b):
-        return a.startswith("/")
+        return _is_abs(a)
     if b.endswith("/" + a):
-        return b.startswith("/")
+        return _is_abs(b)
     return False
 
 

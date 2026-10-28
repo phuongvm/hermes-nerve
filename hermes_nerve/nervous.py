@@ -1009,7 +1009,7 @@ class NervousSystem:
                     state.mutation_attempts += 1
                     if mutation_is_relevant(tool_name, args, state.requested_paths):
                         state.relevant_mutation_attempts += 1
-                elif (kind == "test" and test_succeeded(status, result, error_message)
+                elif (kind == "test" and test_succeeded(status, kwargs.get("result") if kwargs.get("result") is not None else result, error_message)
                       and not test_result_masked(str((args or {}).get("command") or ""))):
                     state.verified_test_passes += 1
                 if (
