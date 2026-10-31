@@ -22,6 +22,10 @@ from hermes_nerve.reflex.systemone import D1Client, SystemOneHTTPClient, SystemO
 
 
 # --------------------------------------------------------------------------- patch 1
+# built from parts so the literal is never masked/abbreviated by log or display filters
+_URL_TOKEN = "ghtoken" + "value" + "123456"
+
+
 class ShellCredentialRedactionTests(unittest.TestCase):
     SECRETS = (
         ("curl --password hunter2 https://x.example/api", "hunter2"),
@@ -46,12 +50,13 @@ class ShellCredentialRedactionTests(unittest.TestCase):
         ('curl -H "Cookie: sid=abc123def456; theme=dark" https://x.example', "abc123def456"),
         ("GET / HTTP/1.1\nCookie: sid=abc123def456\nHost: x", "abc123def456"),
         ("git clone https://user:p4ssw0rd@git.example/r.git", "p4ssw0rd"),
-        ("git clone https://ghtokenvalue123456@git.example/r.git", "ghtokenvalue123456"),
+        ("git clone https://" + _URL_TOKEN + "@git.example/r.git", _URL_TOKEN),
     )
 
     def test_credentials_are_removed(self):
         for text, secret in self.SECRETS:
             with self.subTest(text=text):
+                self.assertIn(secret, text)  # precondition: fixture carries the secret
                 out = redact(text)
                 self.assertNotIn(secret, out)
                 self.assertIn("[REDACTED]", out)
