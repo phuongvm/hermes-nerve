@@ -9,6 +9,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .openjev import _OPENER, _endpoint_allowed
+
 DEFAULT_BASE_URL = "http://127.0.0.1:8765"
 DEFAULT_PATH = "/v1/systemone"
 DEFAULT_MODEL = "convaiinnovations/laya-typed-decisions"
@@ -44,10 +46,10 @@ class LayaClient:
         transport: Callable | None = None,
     ) -> None:
         self.base_url = str(base_url or os.getenv("HERMES_REFLEX_LAYA_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        if not self.base_url.startswith(("http://127.0.0.1", "http://localhost", "https://")):
+        if not _endpoint_allowed(self.base_url):
             raise LayaError(
-                "Laya sidecar must use loopback HTTP or HTTPS. "
-                "For a remote/private host, terminate TLS and configure an https:// URL."
+                "Laya sidecar must use loopback HTTP, private LAN, or HTTPS. "
+                "For a remote host, terminate TLS and configure an https:// URL."
             )
         self.model = str(model or os.getenv("HERMES_REFLEX_LAYA_MODEL") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         raw_timeout = timeout if timeout is not None else os.getenv("HERMES_REFLEX_LAYA_TIMEOUT", str(DEFAULT_TIMEOUT))
@@ -63,7 +65,7 @@ class LayaClient:
     def _urllib_transport(url: str, headers: dict[str, str], body: bytes, timeout: float):
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return int(response.status), response.read(), {str(k).lower(): str(v) for k, v in response.headers.items()}
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]

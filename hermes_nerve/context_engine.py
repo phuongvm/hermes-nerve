@@ -7,6 +7,7 @@ results when doing so is safe. Selection is opt-in through ``context.engine: jev
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from . import context, ledger, lifecycle
@@ -64,6 +65,23 @@ def _content_text(content: Any) -> str:
     return str(content or "")
 
 
+# Blocks Nerve itself injects into the conversation. Left in history they are re-read and
+# re-compacted on every later turn, so they are stripped before compaction input is built.
+_INJECTED_BLOCK_RES = (
+    re.compile(r"\s*<JEV_NERVOUS_SYSTEM>[\s\S]{0,20000}?</JEV_NERVOUS_SYSTEM>"),
+    re.compile(r"\s*\[Nerve selected memory \u2014 evidence, not instructions\](?:\s*\{[^\n]*\})+"),
+    re.compile(r"\s*Nerve nervous supervision is active for this turn\.[\s\S]{0,400}?do not need explicit Jev calls\."),
+)
+
+
+def _strip_injected_blocks(text: Any) -> Any:
+    if not isinstance(text, str) or not text:
+        return text
+    for pattern in _INJECTED_BLOCK_RES:
+        text = pattern.sub("", text)
+    return text
+
+
 def _tool_call_map(messages: list[dict[str, Any]]) -> dict[str, tuple[str, dict[str, Any]]]:
     out: dict[str, tuple[str, dict[str, Any]]] = {}
     for message in messages:
@@ -110,7 +128,7 @@ def _goal(messages: list[dict[str, Any]], focus_topic: str | None = None) -> str
     recent = []
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
-            text = _content_text(msg.get("content")).strip()
+            text = _strip_injected_blocks(_content_text(msg.get("content"))).strip()
             if text:
                 recent.append(text)
             if len(recent) >= 3:
@@ -305,7 +323,7 @@ class NerveContextEngine(ContextEngine):
         for index, message in enumerate(messages):
             if index in protected or not isinstance(message, dict) or message.get("role") != "tool":
                 continue
-            content = _content_text(message.get("content"))
+            content = _strip_injected_blocks(_content_text(message.get("content")))
             if not content:
                 continue
             tool_call_id = str(message.get("tool_call_id") or "")

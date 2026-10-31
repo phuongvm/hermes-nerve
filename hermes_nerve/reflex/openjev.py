@@ -58,6 +58,17 @@ def _endpoint_allowed(base_url: str) -> bool:
     return addr.is_loopback or any(addr in net for net in RFC1918_NETWORKS)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse 3xx: a validated endpoint must not bounce the bearer token to another origin."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# Shared by every reflex backend: no redirects and no environment proxies (HTTP(S)_PROXY).
+_OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+
+
 @dataclass(frozen=True)
 class OpenJevResponse:
     model: str
@@ -112,7 +123,7 @@ class OpenJevClient:
     def _urllib_transport(url: str, headers: dict[str, str], body: bytes, timeout: float):
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return int(response.status), response.read(), {str(k).lower(): str(v) for k, v in response.headers.items()}
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]
@@ -129,7 +140,7 @@ class OpenJevClient:
     def version(self) -> dict[str, Any]:
         request = urllib.request.Request(self.base_url + DEFAULT_VERSION_PATH, headers=self._headers(), method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _OPENER.open(request, timeout=self.timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]

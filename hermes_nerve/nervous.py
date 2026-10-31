@@ -98,6 +98,15 @@ def admission_risk_floor(prompt: str) -> str:
             if pattern.search(text):
                 return "WATCH"
     return ""
+# Pure conversational acknowledgements: bounded so a long message can never ride this fast path.
+_TRIVIAL_RE = re.compile(r"\s*(?:ok(?:ay)?|yes|thanks?(?:\s+you)?|thx|lgtm|ack)\s*[.!]{0,3}\s*", re.IGNORECASE)
+
+
+def _is_trivial_ack(prompt: str) -> bool:
+    text = str(prompt or "")
+    return len(text) <= 40 and _TRIVIAL_RE.fullmatch(text) is not None
+
+
 CONTROL_CHOICES = ["CONTINUE", "GATHER_EVIDENCE", "RETRY", "REPLAN", "ESCALATE"]
 SUPERVISION_MODES = {"shadow", "correct_next", "precommit"}
 BLOCKING_CONTROLS = {"GATHER_EVIDENCE", "REPLAN", "ESCALATE"}
@@ -458,7 +467,15 @@ class NervousSystem:
                 self._session_turn[str(session_id)] = tid
             self._metrics["turns_started"] += 1
         self._log("turn_start", {"turn_id": tid, "session_id": session_id, "prompt_sha256": state.user_message_hash})
-        if self._config.admission_enabled:
+        if self._config.admission_enabled and _is_trivial_ack(user_message):
+            # Skip the admission provider call, but stay armed at WATCH rather than OFF: a bare
+            # "yes" can approve a risky action proposed last turn, and WATCH still promotes to ON
+            # when a material event arrives.
+            with self._lock:
+                state.admission = "WATCH"
+                self._metrics["admission_watch"] += 1
+                self._metrics["admission_trivial_bypass"] += 1
+        elif self._config.admission_enabled:
             if not self._enqueue_task("admit", {"turn_id": tid, "user_message": user_message}):
                 # Keep local supervision active; this is not a tool permission grant.
                 with self._lock:

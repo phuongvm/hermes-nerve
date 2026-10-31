@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..client import scoped_timeout
+from .openjev import _OPENER, _endpoint_allowed
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_PATH = "/v1/systemone"
@@ -59,10 +60,10 @@ class SystemOneHTTPClient:
         self.base_url = str(
             base_url or os.getenv("HERMES_REFLEX_SYSTEMONE_BASE_URL") or DEFAULT_BASE_URL
         ).rstrip("/")
-        if not self.base_url.startswith(("http://127.0.0.1", "http://localhost", "https://")):
+        if not _endpoint_allowed(self.base_url):
             raise SystemOneHTTPError(
-                "System One endpoint must use loopback HTTP or HTTPS. "
-                "For a remote/private host, use an SSH tunnel or terminate TLS."
+                "System One endpoint must use loopback HTTP, private LAN, or HTTPS. "
+                "For a remote host, use an SSH tunnel or terminate TLS."
             )
         self.path = str(path or os.getenv("HERMES_REFLEX_SYSTEMONE_PATH") or DEFAULT_PATH).strip()
         if not self.path.startswith("/") or "://" in self.path:
@@ -101,7 +102,7 @@ class SystemOneHTTPClient:
     def _urllib_transport(url: str, headers: dict[str, str], body: bytes, timeout: float):
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return (
                     int(response.status),
                     response.read(),

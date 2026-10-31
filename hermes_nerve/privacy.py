@@ -23,6 +23,17 @@ _SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL),
     re.compile(r"(?i)([?&](?:api[_-]?key|access[_-]?token|token|secret|password)=)[^&#\s]+"),
     re.compile(r"(?i)\b([A-Z0-9_.-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)\s*[=:]\s*)[^\s,;]+"),
+    # Shell-command credential shapes. Group 1 is the kept prefix, the value is masked.
+    # CLI flags: --password hunter2, --api-key=KEY, --client-secret 'two words'.
+    re.compile(r"""(?i)(?<![\w-])(--(?:password|token|api[-_]?key|secret|client[-_]?secret)[=\s]+)(?:"[^"]*"|'[^']*'|\S+)"""),
+    # curl -u/--user user:pass (all spellings); numeric ids such as `docker exec -u 1000:1000` are not credentials.
+    re.compile(r"""(?i)(?<![\w-])((?:--user|-u)[=\s]{0,2}['"]?)(?![0-9]+:)[^\s:@'"]{0,64}:[^\s@'"]{1,256}"""),
+    # Cookies: `Cookie:` headers and curl -b/--cookie name=value (a bare `-b cookies.txt` is a file, not a cookie).
+    re.compile(r"""(?i)(?<![\w-])(cookie\s*:\s*)[^"'\n]+"""),
+    re.compile(r"""(?i)(?<![\w-])((?:-b|--cookie)[=\s]+)(?:"[^"]*=[^"]*"|'[^']*=[^']*'|\S*=\S*)"""),
+    # URL userinfo: scheme://user:pass@host and scheme://TOKEN@host (host and `@` are kept).
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{1,15}://)[^\s:@/]{1,64}:[^\s@/]{1,256}(?=@)"),
+    re.compile(r"(?i)\b((?:https?|wss?|ftp)://)[^\s:@/]{8,}(?=@)"),
 ]
 
 
