@@ -26,8 +26,9 @@ _SECRET_PATTERNS = [
     # Shell-command credential shapes. Group 1 is the kept prefix, the value is masked.
     # CLI flags: --password hunter2, --api-key=KEY, --client-secret 'two words'.
     re.compile(r"""(?i)(?<![\w-])(--(?:password|token|api[-_]?key|secret|client[-_]?secret)[=\s]+)(?:"[^"]*"|'[^']*'|\S+)"""),
-    # curl -u/--user user:pass (all spellings); numeric ids such as `docker exec -u 1000:1000` are not credentials.
-    re.compile(r"""(?i)(?<![\w-])((?:--user|-u)[=\s]{0,2}['"]?)(?![0-9]+:)[^\s:@'"]{0,64}:[^\s@'"]{1,256}"""),
+    # curl -u/--user user:pass (all spellings); a pure numeric UID:GID pair such as `docker exec -u 1000:1000` is not a credential; quoted values are consumed whole.
+    re.compile(r"""(?i)(?<![\w-])((?:--user|-u)[=\s]{0,2})(?!["']?[0-9]+:[0-9]+["']?(?:\s|$))(?:"[^"\n]*:[^"\n]*"|'[^'\n]*:[^'\n]*')"""),
+    re.compile(r"""(?i)(?<![\w-])((?:--user|-u)[=\s]{0,2})(?![0-9]+:[0-9]+(?:\s|$))[^\s:@'"]{0,64}:[^\s@'"]{1,256}"""),
     # Cookies: `Cookie:` headers and curl -b/--cookie name=value (a bare `-b cookies.txt` is a file, not a cookie).
     re.compile(r"""(?i)(?<![\w-])(cookie\s*:\s*)[^"'\n]+"""),
     re.compile(r"""(?i)(?<![\w-])((?:-b|--cookie)[=\s]+)(?:"[^"]*=[^"]*"|'[^']*=[^']*'|\S*=\S*)"""),

@@ -35,6 +35,12 @@ class ShellCredentialRedactionTests(unittest.TestCase):
         ("curl --user=admin:s3cr3tpw https://x.example", "s3cr3tpw"),
         ("curl -uadmin:s3cr3tpw https://x.example", "s3cr3tpw"),
         ('curl -u "admin:s3cr3tpw" https://x.example', "s3cr3tpw"),
+        ("curl -u 1000:password https://x.example", "password"),
+        ("curl --user 1000:s3cr3tpw https://x.example", "s3cr3tpw"),
+        ("curl -u 1000:1000abc https://x.example", "1000abc"),
+        ('curl -u "admin:pass with spaces" https://x.example', "with spaces"),
+        ("curl -u 'admin:pass with spaces' https://x.example", "with spaces"),
+        ('curl --user="admin:pass with spaces" https://x.example', "pass"),
         ('curl -b "sid=abc123def456" https://x.example', "abc123def456"),
         ("curl --cookie sid=abc123def456 https://x.example", "abc123def456"),
         ('curl -H "Cookie: sid=abc123def456; theme=dark" https://x.example', "abc123def456"),
@@ -53,6 +59,7 @@ class ShellCredentialRedactionTests(unittest.TestCase):
     def test_non_credentials_are_untouched(self):
         for text in (
             "docker exec -u 1000:1000 web ls",
+            'docker exec -u "1000:1000" web ls',
             "sudo -u www-data ls /srv",
             "sort -u names.txt",
             "curl -b cookies.txt https://x.example",
@@ -63,6 +70,10 @@ class ShellCredentialRedactionTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(redact(text), text)
+
+    def test_quoted_password_with_spaces_is_fully_consumed_and_context_kept(self):
+        out = redact('curl -u "admin:pass with spaces" https://x.example/p')
+        self.assertEqual(out, 'curl -u [REDACTED] https://x.example/p')
 
     def test_command_context_survives_and_redaction_is_idempotent_and_recursive(self):
         out = redact("curl -u admin:s3cr3tpw https://x.example/path")
