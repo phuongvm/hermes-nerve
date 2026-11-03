@@ -15,6 +15,14 @@ from .runtime import settings
 _DOD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(definition\s+of\s+done|acceptance\s+criteria|done\s+criteria)\s*$", re.I)
 _ANY_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+?)\s*$")
+_CANONICAL_TASK_ID_RE = re.compile(r"^t_[0-9a-f]{6,}$", re.I)
+_CREW_FIELD_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?\**(Role|Verify|Done\s+when|Units|Artifact|proof\s+command)\**\s*:\s*(.+?)\s*$",
+    re.I,
+)
+_NUMBERED_CLAUSE_SPLIT_RE = re.compile(r"(?:^|\s+)\(\d+\)\s+")
+_WRITER_PROFILES = {"coder", "designer", "worker", "content", "researcher", "leader"}
+_CLOSER_PROFILES = {"reviewer", "qa", "verifier"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,64 @@ def parse_checkpoint_fractions(raw: str) -> tuple[float, ...]:
     return tuple(sorted(values)) or (0.40, 0.70)
 
 
+def parse_crew_contract_fields(body: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for raw in str(body or "").splitlines():
+        m = _CREW_FIELD_RE.match(raw)
+        if not m:
+            continue
+        key = re.sub(r"\s+", " ", m.group(1).strip().lower())
+        val = m.group(2).strip().strip("*_").strip()
+        if val:
+            fields[key] = val
+    return fields
+
+
+def infer_run_terminal_mode(body: str, worker_profile: str | None = None) -> str:
+    """Return ``'handoff'`` when a writer run on a dual/independent Crew card must hand off to review, else ``'complete'``."""
+    fields = parse_crew_contract_fields(body)
+    verify_mode = str(fields.get("verify") or "").strip().lower().split()[0] if fields.get("verify") else ""
+    if verify_mode not in {"dual", "independent"}:
+        return "complete"
+    role = str(fields.get("role") or "").strip().lower().split()[0] if fields.get("role") else ""
+    prof = str(worker_profile or os.getenv("HERMES_PROFILE") or "").strip().lower().lstrip("@")
+    if prof in _CLOSER_PROFILES:
+        return "complete"
+    if prof in _WRITER_PROFILES or role in {"worker", "content"}:
+        return "handoff"
+    return "complete"
+
+
+def _extract_crew_flat_dod_lines(body: str) -> list[str]:
+    fields = parse_crew_contract_fields(body)
+    if not fields:
+        return []
+    items: list[str] = []
+    done_when = fields.get("done when", "").strip().strip("*_").strip()
+    if done_when and done_when.lower() not in {"none", "n/a", "-"}:
+        parts = [p.strip().rstrip(";") for p in _NUMBERED_CLAUSE_SPLIT_RE.split(done_when) if p.strip()]
+        if len(parts) <= 1 and ";" in done_when:
+            parts = [p.strip() for p in done_when.split(";") if p.strip()]
+        for clause in parts:
+            items.append(f"Crew Done-when satisfied: {clause}")
+    units = fields.get("units", "").strip().strip("*_").strip()
+    if units and units.lower() not in {"none", "n/a", "-"}:
+        unit_parts = [u.strip() for u in units.split("|") if u.strip()]
+        if unit_parts:
+            items.append(f"Crew Units satisfied: {', '.join(unit_parts)}")
+    artifact = fields.get("artifact", "").strip().strip("`\"'").strip("*_").strip()
+    if artifact and artifact.lower() not in {"none", "n/a", "-"}:
+        # Take first path token if notes follow in parentheses
+        artifact_path = artifact.split(" (")[0].strip().strip("`\"'").strip("*_").strip()
+        items.append(f"Required artifact exists: `{artifact_path}`")
+    proof_cmd = fields.get("proof command", "").strip().strip("`\"'").strip("*_").strip()
+    if proof_cmd and proof_cmd.lower() not in {"none", "n/a", "-"}:
+        if proof_cmd.startswith("`") and proof_cmd.endswith("`") and len(proof_cmd) > 2:
+            proof_cmd = proof_cmd[1:-1].strip()
+        items.append(f"Proof command passes (rc=0): `{proof_cmd}`")
+    return items
+
+
 def extract_dod_lines(body: str) -> list[str]:
     lines = str(body or "").splitlines()
     start = None
@@ -44,7 +110,7 @@ def extract_dod_lines(body: str) -> list[str]:
             start = idx + 1
             break
     if start is None:
-        return []
+        return _extract_crew_flat_dod_lines(body)
     items: list[str] = []
     current = ""
     for raw in lines[start:]:
@@ -61,7 +127,8 @@ def extract_dod_lines(body: str) -> list[str]:
             current += " " + text
     if current:
         items.append(current.strip())
-    return [x for x in items if x]
+    extracted = [x for x in items if x]
+    return extracted if extracted else _extract_crew_flat_dod_lines(body)
 
 
 def build_criteria(body: str, *, total_budget: int) -> tuple[list[dict[str, Any]], int]:
@@ -227,6 +294,10 @@ def ensure_kanban_binding(supervisor, *, task_id: str = "", session_id: str = ""
     tid = env_tid or str(task_id or "").strip()
     if not tid:
         return None
+    # Non-Kanban chat/cron sessions pass session_id or non-card IDs in task_id.
+    # Never query Kanban DB or log autobind_task_missing unless env_tid is set or tid is a canonical t_<hex> ID.
+    if not env_tid and not _CANONICAL_TASK_ID_RE.match(tid):
+        return None
     # Make the canonical worker env visible to the rest of the plugin even on
     # Hermes builds that only set HERMES_KANBAN_TASK. Only propagate a
     # dispatcher-pinned value: a hook-local fallback may be a session id on
@@ -307,3 +378,111 @@ def ensure_kanban_binding(supervisor, *, task_id: str = "", session_id: str = ""
         bound_at=utc_now(),
     )
     return ident
+
+
+def prune_and_vacuum_supervision_db(
+    db_path: Path | str,
+    backup_dir: Path | str | None = None,
+    *,
+    simulate_failure: bool = False,
+) -> dict[str, Any]:
+    """Backup-guarded live SQLite compaction for work-supervision.sqlite3."""
+    import shutil
+    import sqlite3
+    import time
+
+    target = Path(db_path).expanduser().resolve()
+    if not target.is_file():
+        raise FileNotFoundError(f"Supervision DB not found: {target}")
+
+    size_before = target.stat().st_size
+    free_bytes = shutil.disk_usage(str(target.parent)).free
+    required_free = max(size_before * 3, 1024 * 1024)
+    if free_bytes < required_free:
+        raise RuntimeError(
+            f"Preflight disk space check failed: free={free_bytes}B < required={required_free}B (3x DB size)"
+        )
+
+    bdir = Path(backup_dir).expanduser().resolve() if backup_dir else target.parent
+    bdir.mkdir(parents=True, exist_ok=True)
+    backup_path = bdir / f"{target.stem}.pre-prune-{int(time.time() * 1000)}.sqlite3"
+
+    # Step 1 & 2: Preflight quick_check + baseline counts + online atomic backup
+    src_con = sqlite3.connect(str(target), timeout=30.0)
+    try:
+        src_con.execute("PRAGMA busy_timeout = 30000")
+        qc = src_con.execute("PRAGMA quick_check").fetchone()
+        if not qc or str(qc[0]).lower() != "ok":
+            raise RuntimeError(f"Preflight quick_check failed: {qc}")
+        baseline_counts = {
+            tbl: int(src_con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
+            for tbl in ("contracts", "run_bindings", "run_controls")
+        }
+        missing_before = int(
+            src_con.execute(
+                "SELECT COUNT(*) FROM supervision_diagnostics WHERE kind = 'autobind_task_missing'"
+            ).fetchone()[0]
+        )
+        bck_con = sqlite3.connect(str(backup_path), timeout=30.0)
+        try:
+            src_con.backup(bck_con)
+        finally:
+            bck_con.close()
+    finally:
+        src_con.close()
+
+    # Step 3 & 4: Locked delete + VACUUM + post-checks, with automatic rollback on failure
+    try:
+        work_con = sqlite3.connect(str(target), timeout=30.0, isolation_level=None)
+        try:
+            work_con.execute("PRAGMA busy_timeout = 30000")
+            work_con.execute("BEGIN IMMEDIATE")
+            work_con.execute("DELETE FROM supervision_diagnostics WHERE kind = 'autobind_task_missing'")
+            work_con.execute("COMMIT")
+            if simulate_failure:
+                raise RuntimeError("Simulated failure during supervision DB compaction")
+            work_con.execute("VACUUM")
+            ic = work_con.execute("PRAGMA integrity_check").fetchone()
+            if not ic or str(ic[0]).lower() != "ok":
+                raise RuntimeError(f"Post-vacuum integrity_check failed: {ic}")
+            after_counts = {
+                tbl: int(work_con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
+                for tbl in ("contracts", "run_bindings", "run_controls")
+            }
+            if after_counts != baseline_counts:
+                raise RuntimeError(
+                    f"Control-table counts changed during compaction: before={baseline_counts}, after={after_counts}"
+                )
+            missing_after = int(
+                work_con.execute(
+                    "SELECT COUNT(*) FROM supervision_diagnostics WHERE kind = 'autobind_task_missing'"
+                ).fetchone()[0]
+            )
+            if missing_after != 0:
+                raise RuntimeError(f"Expected 0 autobind_task_missing rows after prune, found {missing_after}")
+        finally:
+            work_con.close()
+    except Exception:
+        # Step 5: Automatic atomic rollback from backup_path
+        bck_con = sqlite3.connect(str(backup_path), timeout=30.0)
+        dst_con = sqlite3.connect(str(target), timeout=30.0)
+        try:
+            dst_con.execute("PRAGMA busy_timeout = 30000")
+            bck_con.backup(dst_con)
+        finally:
+            dst_con.close()
+            bck_con.close()
+        raise
+
+    size_after = target.stat().st_size
+    return {
+        "ok": True,
+        "db_path": str(target),
+        "backup_path": str(backup_path),
+        "pruned_rows": missing_before,
+        "remaining_autobind_task_missing": 0,
+        "preserved_counts": baseline_counts,
+        "size_before": size_before,
+        "size_after": size_after,
+        "integrity_check": "ok",
+    }

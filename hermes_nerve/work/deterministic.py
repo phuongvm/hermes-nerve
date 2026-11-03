@@ -46,6 +46,63 @@ def _terminal_exit(result: Any, kwargs: dict[str, Any]) -> tuple[int | None, str
     return None, text
 
 
+def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Zero-token observer for Crew verdicts.
+
+    When ``crew_verdict`` (or ``crew_review_handoff``) returns ``PASS``, mark any
+    contract criterion whose description mentions ``crew_verdict`` or ``crew review``
+    as VERIFIED_PASS without spending LLM tokens.
+    """
+    tn = str(tool_name or "").strip().lower()
+    if tn not in {"crew_verdict", "crew_review_handoff", "crew_review"}:
+        return {"observed": False, "passed": False}
+    # Parse result
+    text = result if isinstance(result, str) else None
+    try:
+        if text is None:
+            text = json.dumps(result, default=str)
+        payload = json.loads(text)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    verdict = str(payload.get("verdict") or payload.get("value") or "").strip().upper()
+    if verdict != "PASS":
+        return {"observed": True, "passed": False, "verdict": verdict}
+    contract = supervisor.active_contract(identity.task_id)
+    if not contract:
+        return {"observed": True, "passed": True, "verdict": verdict, "marked": 0}
+    evidence = supervisor.store.evidence(identity)
+    evidence_ids = [str(e["evidence_id"]) for e in evidence[-8:]]
+    marked = 0
+    for criterion in contract.criteria:
+        low = str(criterion.description or "").lower()
+        if "crew_verdict" in low or "crew review" in low or "crew_verdict" in low:
+            supervisor.mark_deterministic_verdict(
+                identity,
+                criterion.id,
+                passed=True,
+                reason=f"Zero-token Crew verdict PASS observed via {tn}.",
+                evidence_ids=evidence_ids,
+            )
+            marked += 1
+    # Also mark "Required artifact exists" criteria if the verdict references an artifact
+    artifact_path = str(payload.get("file") or payload.get("artifact") or "").strip()
+    if artifact_path:
+        for criterion in contract.criteria:
+            low = str(criterion.description or "").lower()
+            if "required artifact exists" in low and artifact_path in str(criterion.description or ""):
+                supervisor.mark_deterministic_verdict(
+                    identity,
+                    criterion.id,
+                    passed=True,
+                    reason=f"Zero-token Crew verdict PASS confirms artifact: {artifact_path}.",
+                    evidence_ids=evidence_ids,
+                )
+                marked += 1
+    return {"observed": True, "passed": True, "verdict": verdict, "marked": marked}
+
+
 def observe_test_result(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     if tool_name not in {"terminal", "terminal.exec", "shell", "bash"}:
         return {"observed": False, "failed": False}
@@ -898,11 +955,41 @@ def _evaluate_criterion(supervisor, identity: RunIdentity, criterion, *, workspa
                     break
             passed = ok
             reason = "Protected file(s) are unchanged from the run baseline." if passed else "A protected file changed from the run baseline."
+    elif "required artifact exists" in low:
+        # Extract path from backticks
+        paths = _PATH_RE.findall(desc)
+        if not paths:
+            # Try to extract any backtick-quoted path
+            alt = re.findall(r"`([^`]+)`", desc)
+            paths = alt
+        if paths:
+            passed = all((Path(workspace) / rel).is_file() for rel in paths)
+            reason = "Required artifact exists." if passed else "Required artifact is missing."
+        else:
+            return None, "No artifact path found in criterion; abstaining."
     elif "exists" in low:
         paths = _PATH_RE.findall(desc)
         if paths:
             passed = all((Path(workspace) / rel).is_file() for rel in paths)
             reason = "Required file(s) exist." if passed else "A required file is missing."
+    # Crew zero-token criteria (M-02)
+    elif "crew done-when satisfied" in low:
+        # Free-form prose criterion; cannot be deterministically verified.
+        # Abstain (None) so the semantic verifier handles it.
+        return None, "Crew Done-when criterion requires semantic verification; abstaining from deterministic check."
+    elif "crew verdict" in low or "crew review" in low:
+        # Check if there's already evidence of a PASS verdict
+        evidence = supervisor.store.evidence(identity, criterion_id=criterion.id)
+        has_pass = any(
+            str(e.get("kind") or "") in {"crew_verdict", "deterministic_check"}
+            and not bool(e.get("is_error"))
+            for e in (evidence or [])
+        )
+        if has_pass:
+            passed = True
+            reason = "Zero-token Crew verdict PASS evidence found."
+        else:
+            return None, "No Crew verdict PASS evidence yet; abstaining."
     return passed, reason
 
 

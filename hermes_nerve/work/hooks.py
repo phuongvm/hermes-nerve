@@ -8,8 +8,8 @@ from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any
 
-from .autobind import ensure_kanban_binding
-from .deterministic import canonical_completion_summary, observe_test_result
+from .autobind import ensure_kanban_binding, infer_run_terminal_mode
+from .deterministic import canonical_completion_summary, observe_crew_verdict, observe_test_result
 from .runtime import dispatch_tool, enabled, reviewer, settings, supervisor, tool_dispatcher_available
 from .router import recent_failure_fingerprints, should_call_provider
 from .nerve import evaluate as evaluate_nerve, forecast_extension
@@ -135,6 +135,57 @@ def _terminal_state(control: dict[str, Any] | None) -> str:
     if not control or str(control.get("control") or "") != _TERMINAL_READY_CONTROL:
         return ""
     return str((control.get("payload") or {}).get("lifecycle_state") or "VERIFIED")
+
+
+def _is_crew_handoff_card(identity: RunIdentity) -> bool:
+    """Return True if the run is on a Crew card with Verify: dual/independent."""
+    try:
+        from .autobind import _load_canonical_task
+        task = _load_canonical_task(identity.task_id)
+        body = getattr(task, "body", None) if task is not None else None
+        if not body:
+            return False
+        mode = infer_run_terminal_mode(str(body), worker_profile=os.getenv("HERMES_PROFILE"))
+        return mode == "handoff"
+    except Exception:
+        return False
+
+
+def _dispatch_review_handoff(sup, identity, proposal: dict[str, Any], verdict) -> tuple[bool, str]:
+    """Hand off to reviewer via crew_review_handoff instead of kanban_complete."""
+    from .models import utc_now
+    token = _CONTROLLER_COMPLETION_DISPATCH.set(True)
+    try:
+        summary = str(
+            proposal.get("final_response")
+            or proposal.get("response")
+            or proposal.get("summary")
+            or proposal.get("result")
+            or "Nerve verified the locked Definition of Done; handing off to reviewer."
+        ).strip()
+        result = dispatch_tool("crew_review_handoff", {
+            "card_id": identity.task_id,
+            "summary": summary[:12000],
+        })
+        ok, text = _native_dispatch_succeeded(result)
+        sup.store.add_diagnostic(
+            task_id=identity.task_id, run_id=identity.run_id, kind="handoff_native_dispatch",
+            payload={"ok": ok, "result": text[:2000]}, created_at=utc_now(),
+        )
+        if ok:
+            os.environ["HERMES_KANBAN_STOP_NUDGE"] = "0"
+        return ok, text
+    except Exception as exc:
+        try:
+            sup.store.add_diagnostic(
+                task_id=identity.task_id, run_id=identity.run_id, kind="handoff_native_dispatch_failed",
+                payload={"error": f"{type(exc).__name__}: {exc}"}, created_at=utc_now(),
+            )
+        except Exception:
+            pass
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        _CONTROLLER_COMPLETION_DISPATCH.reset(token)
 
 
 def _worker_completion_intent(tool_name: str, args: dict[str, Any] | None) -> bool:
@@ -787,6 +838,13 @@ def post_tool_call(*, tool_name: str, args: dict[str, Any], result: str, task_id
         )
     except Exception:
         pass
+    # Zero-token Crew verdict observer (M-02)
+    try:
+        observe_crew_verdict(
+            supervisor(), identity, tool_name=str(tool_name), args=args or {}, result=result, kwargs=kwargs
+        )
+    except Exception:
+        pass
     # Only a NEW failing test execution reaches the zero-cost ROI router. An
     # earlier repeated failure must not cause every unrelated tool call to
     # spend another supervisor decision.
@@ -1145,8 +1203,12 @@ def pre_verify(*, task_id: str = "", session_id: str = "", **kwargs: Any):
     except Exception:
         pass
     if verdict.allow:
+        _is_handoff = _is_crew_handoff_card(identity)
         try:
-            _arm_terminal_ready(sup, identity, verdict)
+            if _is_handoff:
+                _set_terminal_lifecycle(sup, identity, verdict, "HANDOFF_VERIFIED")
+            else:
+                _arm_terminal_ready(sup, identity, verdict)
         except Exception as exc:
             return {
                 "action": "continue",
@@ -1154,7 +1216,10 @@ def pre_verify(*, task_id: str = "", session_id: str = "", **kwargs: Any):
                 "rule_key": "jev:work-terminal-ready-error",
             }
         if tool_dispatcher_available():
-            _complete_verified_run(sup, identity, proposal, verdict)
+            if _is_handoff:
+                _dispatch_review_handoff(sup, identity, proposal, verdict)
+            else:
+                _complete_verified_run(sup, identity, proposal, verdict)
             return None
         return {
             "action": "continue",
@@ -1214,6 +1279,20 @@ def on_session_end(*, task_id: str = "", session_id: str = "", **kwargs: Any) ->
             except Exception:
                 pass
             return
+        if state == "HANDOFF_VERIFIED":
+            # Hand off to reviewer instead of completing
+            prior = _prior_verdict(control)
+            ok, native_result = _dispatch_review_handoff(
+                sup, identity, {"session_end": True, "session_id": session_id}, prior
+            )
+            try:
+                sup.store.add_diagnostic(
+                    task_id=identity.task_id, run_id=identity.run_id, kind="handoff_session_end_retry",
+                    payload={"ok": bool(ok), "result": str(native_result)[:1200], "prior_state": state}, created_at=utc_now(),
+                )
+            except Exception:
+                pass
+            return
         prior = _prior_verdict(control)
         ok, native_result = _complete_verified_run(
             sup, identity, {"session_end": True, "session_id": session_id}, prior
@@ -1242,8 +1321,13 @@ def on_session_end(*, task_id: str = "", session_id: str = "", **kwargs: Any) ->
             created_at=utc_now(),
         )
         if verdict.allow:
-            _arm_terminal_ready(sup, identity, verdict)
-            _complete_verified_run(sup, identity, {"session_end": True, "session_id": session_id}, verdict)
+            _is_handoff = _is_crew_handoff_card(identity)
+            if _is_handoff:
+                _set_terminal_lifecycle(sup, identity, verdict, "HANDOFF_VERIFIED")
+                _dispatch_review_handoff(sup, identity, {"session_end": True, "session_id": session_id}, verdict)
+            else:
+                _arm_terminal_ready(sup, identity, verdict)
+                _complete_verified_run(sup, identity, {"session_end": True, "session_id": session_id}, verdict)
     except Exception as exc:
         try:
             from .models import utc_now
