@@ -46,49 +46,104 @@ def _terminal_exit(result: Any, kwargs: dict[str, Any]) -> tuple[int | None, str
     return None, text
 
 
-def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Zero-token observer for Crew verdicts.
-
-    When ``crew_verdict`` (or ``crew_review_handoff``) returns ``PASS``, mark any
-    contract criterion whose description mentions ``crew_verdict`` or ``crew review``
-    as VERIFIED_PASS without spending LLM tokens.
-    """
+def _extract_crew_verdict_call(tool_name: str, args: dict[str, Any] | None, result: Any) -> tuple[str | None, Any]:
     tn = str(tool_name or "").strip().lower()
-    if tn not in {"crew_verdict", "crew_review_handoff", "crew_review"}:
-        return {"observed": False, "passed": False}
-    # Parse result
-    text = result if isinstance(result, str) else None
+    if tn in {"crew_verdict", "crew_review_handoff", "crew_review"}:
+        return tn, result
+    if tn == "tool_call" and isinstance(args, dict):
+        calls = args.get("calls")
+        if isinstance(calls, list):
+            for idx, item in enumerate(calls):
+                if not isinstance(item, dict):
+                    continue
+                cname = str(item.get("name") or "").strip().lower()
+                if cname in {"crew_verdict", "crew_review_handoff", "crew_review"}:
+                    sub_res = result
+                    if isinstance(result, str):
+                        try:
+                            parsed = json.loads(result)
+                            if isinstance(parsed, dict) and isinstance(parsed.get("results"), list) and idx < len(parsed["results"]):
+                                sub_res = parsed["results"][idx]
+                        except Exception:
+                            pass
+                    elif isinstance(result, dict) and isinstance(result.get("results"), list) and idx < len(result["results"]):
+                        sub_res = result["results"][idx]
+                    return cname, sub_res
+    return None, result
+
+
+def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Zero-token observer for Crew verdicts (`provider_calls == 0`)."""
+    tn, unwrapped = _extract_crew_verdict_call(tool_name, args, result)
+    if tn is None:
+        return {"observed": False, "passed": False, "failed": False, "provider_calls": 0}
+    text = unwrapped if isinstance(unwrapped, str) else None
     try:
         if text is None:
-            text = json.dumps(result, default=str)
+            text = json.dumps(unwrapped, default=str)
         payload = json.loads(text)
     except Exception:
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
+    if isinstance(payload.get("result"), dict):
+        payload = payload["result"]
+    elif isinstance(payload.get("result"), str):
+        try:
+            inner = json.loads(payload["result"])
+            if isinstance(inner, dict):
+                payload = inner
+        except Exception:
+            pass
+
     verdict = str(payload.get("verdict") or payload.get("value") or "").strip().upper()
-    if verdict != "PASS":
-        return {"observed": True, "passed": False, "verdict": verdict}
+    raw_rc = payload.get("rc", payload.get("proof_rc", payload.get("exit_code")))
+    rc: int | None = None
+    if raw_rc is not None and str(raw_rc).strip() != "":
+        try:
+            rc = int(raw_rc)
+        except (TypeError, ValueError):
+            rc = 1
+
+    if tn != "crew_verdict" and verdict != "PASS":
+        return {"observed": False, "passed": False, "failed": False, "provider_calls": 0}
+    if not verdict and rc is None:
+        return {"observed": False, "passed": False, "failed": False, "provider_calls": 0}
+
+    passed = (verdict == "PASS" or (not verdict and rc == 0)) and (rc is None or rc == 0)
+    if verdict == "FAIL" or (rc is not None and rc != 0):
+        passed = False
+
     contract = supervisor.active_contract(identity.task_id)
     if not contract:
-        return {"observed": True, "passed": True, "verdict": verdict, "marked": 0}
+        return {
+            "observed": True,
+            "passed": passed,
+            "failed": not passed,
+            "verdict": verdict or ("PASS" if passed else "FAIL"),
+            "marked": 0,
+            "provider_calls": 0,
+        }
     evidence = supervisor.store.evidence(identity)
     evidence_ids = [str(e["evidence_id"]) for e in evidence[-8:]]
     marked = 0
     for criterion in contract.criteria:
         low = str(criterion.description or "").lower()
-        if "crew_verdict" in low or "crew review" in low or "crew_verdict" in low:
+        if any(tok in low for tok in ("crew_verdict", "crew review", "crew verdict", "proof command passes")):
             supervisor.mark_deterministic_verdict(
                 identity,
                 criterion.id,
-                passed=True,
-                reason=f"Zero-token Crew verdict PASS observed via {tn}.",
+                passed=passed,
+                reason=(
+                    f"Zero-token Crew verdict PASS (rc={rc if rc is not None else 0}) observed via {tn}."
+                    if passed else
+                    f"Authoritative deterministic Crew verdict FAIL (verdict={verdict or 'FAIL'}, rc={rc}) observed via {tn}."
+                ),
                 evidence_ids=evidence_ids,
             )
             marked += 1
-    # Also mark "Required artifact exists" criteria if the verdict references an artifact
     artifact_path = str(payload.get("file") or payload.get("artifact") or "").strip()
-    if artifact_path:
+    if passed and artifact_path:
         for criterion in contract.criteria:
             low = str(criterion.description or "").lower()
             if "required artifact exists" in low and artifact_path in str(criterion.description or ""):
@@ -100,10 +155,22 @@ def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, a
                     evidence_ids=evidence_ids,
                 )
                 marked += 1
-    return {"observed": True, "passed": True, "verdict": verdict, "marked": marked}
+    return {
+        "observed": True,
+        "passed": passed,
+        "failed": not passed,
+        "verdict": verdict or ("PASS" if passed else "FAIL"),
+        "marked": marked,
+        "provider_calls": 0,
+    }
 
 
 def observe_test_result(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    tn, _ = _extract_crew_verdict_call(tool_name, args, result)
+    if tn == "crew_verdict":
+        return observe_crew_verdict(
+            supervisor, identity, tool_name=tool_name, args=args, result=result, kwargs=kwargs
+        )
     if tool_name not in {"terminal", "terminal.exec", "shell", "bash"}:
         return {"observed": False, "failed": False}
     command = str((args or {}).get("command") or (args or {}).get("cmd") or "")

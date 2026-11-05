@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any
 
-from .autobind import ensure_kanban_binding, infer_run_terminal_mode
+from .autobind import _CANONICAL_TASK_ID_RE, ensure_kanban_binding, infer_run_terminal_mode
 from .deterministic import canonical_completion_summary, observe_crew_verdict, observe_test_result
 from .runtime import dispatch_tool, enabled, reviewer, settings, supervisor, tool_dispatcher_available
 from .router import recent_failure_fingerprints, should_call_provider
@@ -186,6 +186,19 @@ def _dispatch_review_handoff(sup, identity, proposal: dict[str, Any], verdict) -
         return False, f"{type(exc).__name__}: {exc}"
     finally:
         _CONTROLLER_COMPLETION_DISPATCH.reset(token)
+
+
+def _is_handoff_tool_call(tool_name: str, args: dict[str, Any] | None) -> bool:
+    name = str(tool_name or "").strip().lower()
+    if name in {"crew_review_handoff", "kanban_request_review"}:
+        return True
+    if name == "tool_call" and isinstance(args, dict):
+        calls = args.get("calls")
+        if isinstance(calls, list):
+            for item in calls:
+                if isinstance(item, dict) and str(item.get("name") or "").strip().lower() == "crew_review_handoff":
+                    return True
+    return False
 
 
 def _worker_completion_intent(tool_name: str, args: dict[str, Any] | None) -> bool:
@@ -413,23 +426,20 @@ def _identity(task_id: str | None = None, *, session_id: str = ""):
         return identity
     if not enabled():
         return None
+    env_tid = str(os.getenv("HERMES_KANBAN_TASK_ID") or os.getenv("HERMES_KANBAN_TASK") or "").strip()
+    cand_tid = env_tid or str(task_id or "").strip()
+    if not cand_tid or (not env_tid and not _CANONICAL_TASK_ID_RE.match(cand_tid)):
+        return None
     try:
-        identity = ensure_kanban_binding(supervisor(), task_id=str(task_id or ""), session_id=session_id)
+        identity = ensure_kanban_binding(supervisor(), task_id=cand_tid, session_id=session_id)
     except Exception:
         identity = None
     if identity is not None:
         return identity
-    # Dispatcher-pinned identity wins over hook-local identifiers. Some Hermes
-    # lifecycle paths pass a session/subtask id in ``task_id``; treating that as
-    # canonical creates noisy ``autobind_task_missing`` rows and can detach the
-    # completion audit from the owning run.
-    tid = str(os.getenv("HERMES_KANBAN_TASK_ID") or os.getenv("HERMES_KANBAN_TASK") or task_id or "").strip()
-    if tid:
-        try:
-            return supervisor().store.current_identity(tid)
-        except Exception:
-            return None
-    return None
+    try:
+        return supervisor().store.current_identity(cand_tid)
+    except Exception:
+        return None
 
 
 def _checkpoint_safe(tool_name: str, args: dict[str, Any]) -> bool:
@@ -564,10 +574,55 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, sessio
     name = str(tool_name or "")
 
     # A controller-owned dispatch re-enters Hermes' normal tool pipeline. Let
-    # that exact recursive kanban_complete invocation through; all model-originated
-    # lifecycle attempts remain fenced below.
-    if name == "kanban_complete" and bool(_CONTROLLER_COMPLETION_DISPATCH.get()):
+    # that exact recursive kanban_complete / crew_review_handoff invocation through;
+    # all model-originated lifecycle attempts remain fenced below.
+    if name in {"kanban_complete", "crew_review_handoff"} and bool(_CONTROLLER_COMPLETION_DISPATCH.get()):
         return None
+
+    try:
+        terminal_control = sup.control_for_run(identity)
+    except Exception:
+        terminal_control = None
+
+    # Role-Terminal Review Handoff on Verify: dual | independent Crew cards
+    handoff_intent = _is_handoff_tool_call(name, args or {})
+    is_handoff_card = _is_crew_handoff_card(identity)
+    if handoff_intent and is_handoff_card:
+        if terminal_control and str(terminal_control.get("control") or "") == _TERMINAL_READY_CONTROL:
+            if _terminal_state(terminal_control) == "HANDOFF_VERIFIED":
+                return None
+        try:
+            verdict = sup.verify_completion(
+                identity,
+                proposal={
+                    "summary": (args or {}).get("summary"),
+                    "result": (args or {}).get("result"),
+                    "trigger": "worker_handoff_intent",
+                    "tool_name": name,
+                },
+            )
+        except Exception as exc:
+            return {
+                "action": "block",
+                "message": f"Nerve controller could not verify review handoff: {type(exc).__name__}: {exc}",
+                "rule_key": "jev:work-completion-error",
+            }
+        if verdict.allow:
+            try:
+                _set_terminal_lifecycle(sup, identity, verdict, "HANDOFF_VERIFIED")
+            except Exception as exc:
+                return {
+                    "action": "block",
+                    "message": f"Nerve verified review handoff but could not persist HANDOFF_VERIFIED state: {type(exc).__name__}: {exc}",
+                    "rule_key": "jev:work-terminal-ready-error",
+                }
+            os.environ["HERMES_KANBAN_STOP_NUDGE"] = "0"
+            return None
+        return {
+            "action": "block",
+            "message": verdict.reason + (f" Missing: {', '.join(verdict.missing_criteria)}" if verdict.missing_criteria else ""),
+            "rule_key": "jev:work-completion",
+        }
 
     # N-23: a worker block is never terminally accepted on prose. The
     # deterministic judge refutes lazy/premature surrenders with a work order
@@ -599,10 +654,38 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, sessio
     bypass_reason = _kanban_authority_bypass(name, args or {})
     completion_intent = _worker_completion_intent(name, args or {})
 
-    try:
-        terminal_control = sup.control_for_run(identity)
-    except Exception:
-        terminal_control = None
+    if completion_intent and is_handoff_card:
+        try:
+            verdict = sup.verify_completion(
+                identity,
+                proposal={
+                    "summary": (args or {}).get("summary"),
+                    "result": (args or {}).get("result"),
+                    "trigger": "worker_completion_on_handoff_card",
+                    "tool_name": name,
+                },
+            )
+        except Exception as exc:
+            return {
+                "action": "block",
+                "message": f"Nerve controller could not verify DoD on handoff card: {type(exc).__name__}: {exc}",
+                "rule_key": "jev:work-completion-error",
+            }
+        if not verdict.allow:
+            return {
+                "action": "block",
+                "message": verdict.reason + (f" Missing: {', '.join(verdict.missing_criteria)}" if verdict.missing_criteria else ""),
+                "rule_key": "jev:work-completion",
+            }
+        _set_terminal_lifecycle(sup, identity, verdict, "HANDOFF_VERIFIED")
+        return {
+            "action": "block",
+            "message": (
+                "Writer role on a Verify: dual/independent card cannot call kanban_complete directly. "
+                "Nerve recorded HANDOFF_VERIFIED; invoke crew_review_handoff or kanban_request_review instead."
+            ),
+            "rule_key": "jev:work-handoff-required",
+        }
 
     # Dev15: the model never owns completion when the plugin has Hermes'
     # in-process dispatcher capability. Any completion intent (native tool,
@@ -838,13 +921,14 @@ def post_tool_call(*, tool_name: str, args: dict[str, Any], result: str, task_id
         )
     except Exception:
         pass
-    # Zero-token Crew verdict observer (M-02)
-    try:
-        observe_crew_verdict(
-            supervisor(), identity, tool_name=str(tool_name), args=args or {}, result=result, kwargs=kwargs
-        )
-    except Exception:
-        pass
+    # Zero-token Crew verdict observer for review handoff / supplementary verdict tools (M-02)
+    if not test_observation.get("observed"):
+        try:
+            observe_crew_verdict(
+                supervisor(), identity, tool_name=str(tool_name), args=args or {}, result=result, kwargs=kwargs
+            )
+        except Exception:
+            pass
     # Only a NEW failing test execution reaches the zero-cost ROI router. An
     # earlier repeated failure must not cause every unrelated tool call to
     # spend another supervisor decision.
@@ -1155,7 +1239,7 @@ def pre_verify(*, task_id: str = "", session_id: str = "", **kwargs: Any):
         control = None
     if control and str(control.get("control") or "") == _TERMINAL_READY_CONTROL:
         state = _terminal_state(control)
-        if state == "COMPLETED":
+        if state in {"COMPLETED", "HANDOFF_VERIFIED"}:
             return None
         prior = _prior_verdict(control)
         if tool_dispatcher_available():
@@ -1280,15 +1364,10 @@ def on_session_end(*, task_id: str = "", session_id: str = "", **kwargs: Any) ->
                 pass
             return
         if state == "HANDOFF_VERIFIED":
-            # Hand off to reviewer instead of completing
-            prior = _prior_verdict(control)
-            ok, native_result = _dispatch_review_handoff(
-                sup, identity, {"session_end": True, "session_id": session_id}, prior
-            )
             try:
                 sup.store.add_diagnostic(
-                    task_id=identity.task_id, run_id=identity.run_id, kind="handoff_session_end_retry",
-                    payload={"ok": bool(ok), "result": str(native_result)[:1200], "prior_state": state}, created_at=utc_now(),
+                    task_id=identity.task_id, run_id=identity.run_id, kind="completion_session_end_skipped",
+                    payload={"reason": "writer review handoff already verified; never auto-complete", "lifecycle_state": state}, created_at=utc_now(),
                 )
             except Exception:
                 pass
