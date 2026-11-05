@@ -8,10 +8,38 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
+from typing import Any
 from .selective_context import (
     ContextCandidate, ContextAdmissionController, SelectiveContextConfig,
     SurfaceConfig, estimate_tokens,
 )
+
+# Skills surface scans the complete Hermes catalog (410 active skills at baseline)
+# so discretionary skills past row 128 are lexically scored instead of CANDIDATE_CAP.
+SKILLS_MAX_CANDIDATES_DEFAULT = 512
+_SKILL_LIST_KEYS = ('selective_context_mandatory_skills', 'selective_context_pinned_skills')
+
+
+def normalize_skill_names(value):
+    """Operator skill list -> ``list[str]`` of non-empty names; ``None`` when invalid.
+
+    Accepts a list/tuple of names or a comma-separated string (config.yaml and
+    env-style settings both reach here). ``None``/empty means no pins.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.split(',')
+    if not isinstance(value, (list, tuple)):
+        return None
+    names = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        item = item.strip()
+        if item:
+            names.append(item)
+    return names
 
 
 def settings_from_config(config, *, home=None):
@@ -58,6 +86,13 @@ def settings_from_config(config, *, home=None):
                 if active and resolved.enabled(f"selective_context_{kind}")
                 else "off"
             )
+        settings["selective_context_skills_max_candidates"] = resolved.get_config(
+            "selective_context_skills_max_candidates", SKILLS_MAX_CANDIDATES_DEFAULT)
+        for key in _SKILL_LIST_KEYS:
+            names = normalize_skill_names(resolved.get_config(key, []))
+            if names is None:
+                raise ValueError(f"{key} must be a list of skill names")
+            settings[key] = names
         return settings
     except (KeyError, TypeError, ValueError, ProfileStateError):
         return off
@@ -72,7 +107,7 @@ def _controller(settings, kind):
     defaults = {
         'memory': (24, 8, .28),
         'tools': (128, 16, .18),
-        'skills': (128, 5, .22),
+        'skills': (SKILLS_MAX_CANDIDATES_DEFAULT, 5, .22),
     }.get(kind)
     if defaults is None:
         raise ValueError('unknown selective-context surface')
@@ -87,33 +122,43 @@ def _controller(settings, kind):
 
 
 _ENTRY = re.compile(r'^(?P<prefix>    - )(?P<name>[^:\n]+): (?P<desc>.*)$')
+_LF, _CRLF = chr(10), chr(13) + chr(10)
+_EOL_CHARS = chr(13) + chr(10)
 
 
-def select_skills_index(stock_index, goal, settings):
-    """Demote only known index description lines; preserve every other byte/name.
+def _stock_plan(reason):
+    return {'schema': 'hermes-nerve-selective-context/v1', 'kind': 'skill', 'mode': 'off',
+            'fail_open': True, 'reason': reason, 'decisions': [], 'selected_ids': [],
+            'effective_selected_ids': []}
 
-    mandatory_skills/pinned_skills are explicit operator setting lists. Ambiguous
-    entries (plugin namespaces, collision markers) are conservatively retained.
-    No goal, off/shadow, invalid input or planner failure returns stock unchanged.
+
+def plan_skills_index(stock_index, goal, settings=None) -> tuple[str, dict[str, Any]]:
+    """Run the skills selective-context planner; return ``(rendered_index, plan)``.
+
+    ``rendered_index`` is exactly what ``select_skills_index`` returns. ``plan`` is the
+    controller result with every decision annotated with the skill ``name`` so callers
+    (gates, dashboards) can prove a pin/admit without re-parsing the rendered string.
+    Any invalid input or planner failure returns ``(stock_index, fail-open plan)``.
     """
+    settings = {} if settings is None else settings
     try:
         controller = _controller(settings, 'skills')
         if not isinstance(goal, str) or not goal.strip() or not isinstance(stock_index, str):
-            return stock_index
+            return stock_index, _stock_plan('no-goal')
         pinned = set()
-        for key in ('selective_context_mandatory_skills', 'selective_context_pinned_skills'):
-            names = settings.get(key, [])
-            if not isinstance(names, list) or any(not isinstance(n, str) or not n for n in names):
-                return stock_index
+        for key in _SKILL_LIST_KEYS:
+            names = normalize_skill_names(settings.get(key, []))
+            if names is None:
+                return stock_index, _stock_plan('invalid-skill-list')
             pinned.update(names)
         if stock_index.count('<available_skills>') != 1 or stock_index.count('</available_skills>') != 1:
-            return stock_index
+            return stock_index, _stock_plan('no-index')
         before, body = stock_index.split('<available_skills>', 1)
         body, after = body.split('</available_skills>', 1)
         lines = body.splitlines(keepends=True)
         candidates, matches = [], {}
         for i, line in enumerate(lines):
-            match = _ENTRY.fullmatch(line.rstrip('\r\n'))
+            match = _ENTRY.fullmatch(line.rstrip(_EOL_CHARS))
             if not match:
                 continue
             name, desc = match['name'], match['desc']
@@ -123,16 +168,31 @@ def select_skills_index(stock_index, goal, settings):
                                                estimate_tokens(line), mandatory=mandatory))
             matches[cid] = (i, name)
         result = controller.plan(goal=goal, candidates=candidates, kind='skill')
+        plan = dict(result)
+        plan['decisions'] = [{**d, 'item_id': d['candidate_id'],
+                              'name': matches.get(d['candidate_id'], (None, ''))[1]}
+                             for d in result.get('decisions', [])]
         if result['mode'] != 'apply' or result['fail_open']:
-            return stock_index
+            plan['fail_open'] = True
+            return stock_index, plan
         selected = set(result['effective_selected_ids'])
         for cid, (i, name) in matches.items():
             if cid not in selected:
-                ending = '\r\n' if lines[i].endswith('\r\n') else '\n' if lines[i].endswith('\n') else ''
+                ending = _CRLF if lines[i].endswith(_CRLF) else _LF if lines[i].endswith(_LF) else ''
                 lines[i] = f'    - {name}{ending}'
-        return before + '<available_skills>' + ''.join(lines) + '</available_skills>' + after
+        return before + '<available_skills>' + ''.join(lines) + '</available_skills>' + after, plan
     except Exception:
-        return stock_index
+        return stock_index, _stock_plan('planner-error')
+
+
+def select_skills_index(stock_index, goal, settings):
+    """Demote only known index description lines; preserve every other byte/name.
+
+    mandatory_skills/pinned_skills are explicit operator setting lists. Ambiguous
+    entries (plugin namespaces, collision markers) are conservatively retained.
+    No goal, off/shadow, invalid input or planner failure returns stock unchanged.
+    """
+    return plan_skills_index(stock_index, goal, settings)[0]
 
 
 
