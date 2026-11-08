@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 from hermes_nerve.engine import DecisionEngine
 from hermes_nerve.receipts import report as receipt_report
 from hermes_nerve.reflex import config as reflex_config
-from hermes_nerve.reflex.openjev import OpenJevClient, OpenJevError
+from hermes_nerve.reflex.openjev import OpenJevCircuitOpenError, OpenJevClient, OpenJevError, _CircuitBreaker
 from hermes_nerve.reflex.shadow import ShadowProvider
 from hermes_nerve.reflex.telemetry import report as shadow_report
 
@@ -231,6 +232,109 @@ class OpenJevDev17Tests(unittest.TestCase):
         self.assertIsInstance(provider, OpenJevClient)
         self.assertEqual(provider.model, "ollaya/pplx-decider:flash-fp16")
         self.assertEqual(reflex_config.settings()["openjev_model"], "ollaya/pplx-decider:flash-fp16")
+
+    def test_circuit_breaker_trips_after_three_timeouts_and_fails_fast(self):
+        call_count = 0
+
+        def timeout_transport(url, headers, body, timeout):
+            nonlocal call_count
+            call_count += 1
+            raise OpenJevError("OpenJev helper connection failed: timed out")
+
+        client = OpenJevClient(
+            base_url="http://127.0.0.1:3000",
+            transport=timeout_transport,
+            circuit_breaker=_CircuitBreaker(failure_threshold=3, cooldown_seconds=60.0),
+        )
+        self.assertEqual(client.circuit_state, "CLOSED")
+
+        # First 3 attempts trigger transport and raise standard OpenJevError
+        for i in range(1, 4):
+            with self.assertRaises(OpenJevError) as ctx:
+                client.system_one(state={"x": i}, questions={"q": {"type": "noul", "instructions": "test"}})
+            self.assertNotIsInstance(ctx.exception, OpenJevCircuitOpenError)
+            self.assertEqual(call_count, i)
+
+        # After 3 timeouts, circuit state is OPEN
+        self.assertEqual(client.circuit_state, "OPEN")
+
+        # 4th call immediately raises OpenJevCircuitOpenError without invoking transport
+        with self.assertRaises(OpenJevCircuitOpenError):
+            client.system_one(state={"x": 4}, questions={"q": {"type": "noul", "instructions": "test"}})
+        self.assertEqual(call_count, 3)  # Transport was NOT called
+
+    def test_circuit_breaker_non_timeout_errors_do_not_trip_breaker(self):
+        call_count = 0
+
+        def error_400_transport(url, headers, body, timeout):
+            nonlocal call_count
+            call_count += 1
+            return 400, b'{"error": "bad request"}', {}
+
+        client = OpenJevClient(
+            base_url="http://127.0.0.1:3000",
+            transport=error_400_transport,
+            circuit_breaker=_CircuitBreaker(failure_threshold=3, cooldown_seconds=60.0),
+        )
+        for i in range(1, 5):
+            with self.assertRaises(OpenJevError) as ctx:
+                client.system_one(state={"x": i}, questions={"q": {"type": "noul", "instructions": "test"}})
+            self.assertNotIsInstance(ctx.exception, OpenJevCircuitOpenError)
+            self.assertIn("HTTP 400", str(ctx.exception))
+        self.assertEqual(call_count, 4)
+        self.assertEqual(client.circuit_state, "CLOSED")
+
+    def test_circuit_breaker_half_open_probe_recovers_and_reopens(self):
+        mode = "timeout"
+        call_count = 0
+
+        def dynamic_transport(url, headers, body, timeout):
+            nonlocal call_count
+            call_count += 1
+            if mode == "timeout":
+                raise OpenJevError("OpenJev helper connection failed: timed out")
+            return 200, json.dumps({"answers": {"q": {"type": "noul", "noul": 0.8}}, "usage": {}}).encode(), {}
+
+        breaker = _CircuitBreaker(failure_threshold=3, cooldown_seconds=0.1)
+        client = OpenJevClient(
+            base_url="http://127.0.0.1:3000",
+            transport=dynamic_transport,
+            circuit_breaker=breaker,
+        )
+
+        # Trip to OPEN
+        for i in range(3):
+            with self.assertRaises(OpenJevError):
+                client.system_one(state="x", questions={"q": {"type": "noul", "instructions": "test"}})
+        self.assertEqual(client.circuit_state, "OPEN")
+        self.assertEqual(call_count, 3)
+
+        # Wait for cooldown to expire -> HALF_OPEN
+        time.sleep(0.12)
+        self.assertEqual(client.circuit_state, "HALF_OPEN")
+
+        # Trial probe succeeds -> recovers to CLOSED
+        mode = "success"
+        resp = client.system_one(state="x", questions={"q": {"type": "noul", "instructions": "test"}})
+        self.assertEqual(resp.answers["q"]["noul"], 0.8)
+        self.assertEqual(client.circuit_state, "CLOSED")
+        self.assertEqual(call_count, 4)
+
+        # Now trip again and verify trial probe timeout reopens
+        mode = "timeout"
+        for i in range(3):
+            with self.assertRaises(OpenJevError):
+                client.system_one(state="x", questions={"q": {"type": "noul", "instructions": "test"}})
+        self.assertEqual(client.circuit_state, "OPEN")
+
+        time.sleep(0.12)
+        self.assertEqual(client.circuit_state, "HALF_OPEN")
+
+        # Trial probe times out -> re-enters OPEN immediately
+        with self.assertRaises(OpenJevError):
+            client.system_one(state="x", questions={"q": {"type": "noul", "instructions": "test"}})
+        self.assertEqual(client.circuit_state, "OPEN")
+
 
 
 if __name__ == "__main__": unittest.main()

@@ -110,6 +110,7 @@ def _is_trivial_ack(prompt: str) -> bool:
 CONTROL_CHOICES = ["CONTINUE", "GATHER_EVIDENCE", "RETRY", "REPLAN", "ESCALATE"]
 SUPERVISION_MODES = {"shadow", "correct_next", "precommit"}
 BLOCKING_CONTROLS = {"GATHER_EVIDENCE", "REPLAN", "ESCALATE"}
+MAX_ASSESSMENT_STATE_CHARS = 8000
 
 _TRANSIENT_FAILURE_MARKERS = (
     "timeout", "timed out", "connection reset", "connection refused", "connection failed",
@@ -1453,12 +1454,18 @@ class NervousSystem:
                     "latency_ms": latency_ms,
                 })
         except Exception as exc:
+            is_circuit_open = "circuit breaker is open" in str(exc).lower()
             with self._lock:
                 state = self._turns.get(tid)
                 if state:
                     state.provider_errors += 1
                 self._metrics["provider_errors"] += 1
-            self._log("assessment_error", {"turn_id": tid, "event_id": event.get("event_id"), "error": str(exc)[:500]})
+                if is_circuit_open:
+                    self._metrics["reflex_circuit_open_suppressed"] += 1
+            if is_circuit_open:
+                self._log("reflex_circuit_open", {"turn_id": tid, "event_id": event.get("event_id"), "reason": str(exc)[:500]})
+            else:
+                self._log("assessment_error", {"turn_id": tid, "event_id": event.get("event_id"), "error": str(exc)[:500]})
         finally:
             batch_payload = None
             with self._lock:
@@ -1506,6 +1513,46 @@ class NervousSystem:
             if batch_payload is not None:
                 self._tasks.put(("assess", batch_payload, contextvars.copy_context()))
 
+    def _bound_assessment_state(self, candidate: dict[str, Any], max_chars: int = MAX_ASSESSMENT_STATE_CHARS) -> dict[str, Any]:
+        raw = json.dumps(candidate, separators=(",", ":"), default=str)
+        if len(raw) <= max_chars:
+            return candidate
+
+        event = dict(candidate.get("event") or {})
+        event_state = dict(event.get("state") or {}) if isinstance(event.get("state"), dict) else event.get("state")
+
+        if isinstance(event_state, dict):
+            if "result_preview" in event_state:
+                event_state["result_preview"] = str(event_state["result_preview"])[:400] + "...[truncated]"
+            if "events" in event_state and isinstance(event_state["events"], list) and len(event_state["events"]) > 3:
+                event_state["events"] = event_state["events"][-3:]
+                event_state["batched_event_count_truncated"] = True
+            if "args" in event_state and isinstance(event_state["args"], dict):
+                bounded_args = {}
+                for k, v in event_state["args"].items():
+                    if isinstance(v, str) and len(v) > 300:
+                        bounded_args[k] = v[:300] + "...[truncated]"
+                    else:
+                        bounded_args[k] = v
+                event_state["args"] = bounded_args
+            event["state"] = event_state
+            candidate = dict(candidate)
+            candidate["event"] = event
+            raw = json.dumps(candidate, separators=(",", ":"), default=str)
+            if len(raw) <= max_chars:
+                return candidate
+
+        if isinstance(event, dict):
+            event = dict(event)
+            event["state"] = {
+                "truncated_by_bound": True,
+                "preview": str(event.get("state") or "")[:600] + "...[truncated]",
+            }
+            candidate = dict(candidate)
+            candidate["event"] = event
+
+        return candidate
+
     def _assessment_state(self, state: TurnState, event: dict[str, Any]) -> dict[str, Any]:
         failure_episode = None
         fail_fp = str(event.get("failure_fingerprint") or "")
@@ -1519,7 +1566,7 @@ class NervousSystem:
                     "blocked_attempts": episode.blocked_attempts,
                     "last_control": episode.last_control,
                 }
-        return {
+        candidate = {
             "turn": {
                 "turn_id": state.turn_id,
                 "admission": state.admission,
@@ -1530,6 +1577,7 @@ class NervousSystem:
             "failure_episode": failure_episode,
             "recent_event_types": [str(x.get("type") or "") for x in list(state.recent_events)[-12:]],
         }
+        return self._bound_assessment_state(candidate)
 
     def pop_challenge(self, *, turn_id: str = "", session_id: str = "") -> dict[str, Any] | None:
         state = self._resolve_turn(turn_id=turn_id, session_id=session_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,6 +21,86 @@ DEFAULT_TIMEOUT = 10.0
 
 class OpenJevError(RuntimeError):
     pass
+
+
+class OpenJevCircuitOpenError(OpenJevError):
+    """Raised when the OpenJev circuit breaker is OPEN due to repeated timeouts."""
+    pass
+
+
+DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 3
+DEFAULT_CIRCUIT_COOLDOWN_SECONDS = 60.0
+
+
+class _CircuitBreaker:
+    """Thread-safe sliding-window circuit breaker for OpenJev helper requests."""
+
+    def __init__(
+        self,
+        failure_threshold: int = DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+        cooldown_seconds: float = DEFAULT_CIRCUIT_COOLDOWN_SECONDS,
+    ) -> None:
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.cooldown_seconds = max(0.05, float(cooldown_seconds))
+        self._lock = threading.Lock()
+        self._state: str = "CLOSED"
+        self._consecutive_timeouts: int = 0
+        self._opened_at: float = 0.0
+        self._trial_in_flight: bool = False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            if self._state == "OPEN":
+                if time.monotonic() - self._opened_at >= self.cooldown_seconds:
+                    return "HALF_OPEN"
+            return self._state
+
+    def before_request(self) -> None:
+        with self._lock:
+            if self._state == "OPEN":
+                elapsed = time.monotonic() - self._opened_at
+                if elapsed >= self.cooldown_seconds:
+                    self._state = "HALF_OPEN"
+                    self._trial_in_flight = True
+                    return
+                raise OpenJevCircuitOpenError(
+                    f"OpenJev circuit breaker is OPEN ({self._consecutive_timeouts} consecutive timeouts; "
+                    f"{max(0.0, self.cooldown_seconds - elapsed):.1f}s cooldown remaining)"
+                )
+            if self._state == "HALF_OPEN":
+                if self._trial_in_flight:
+                    raise OpenJevCircuitOpenError("OpenJev circuit breaker is HALF_OPEN (trial request in flight)")
+                self._trial_in_flight = True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_timeouts = 0
+            self._state = "CLOSED"
+            self._trial_in_flight = False
+
+    def record_failure(self, exc: Exception) -> None:
+        msg = str(exc).lower()
+        is_timeout = isinstance(exc, TimeoutError) or "timeout" in msg or "timed out" in msg
+        with self._lock:
+            self._trial_in_flight = False
+            if is_timeout:
+                self._consecutive_timeouts += 1
+                if self._consecutive_timeouts >= self.failure_threshold or self._state == "HALF_OPEN":
+                    self._state = "OPEN"
+                    self._opened_at = time.monotonic()
+            elif self._state == "HALF_OPEN":
+                # Non-timeout error from responding server still proves connectivity
+                self._state = "CLOSED"
+                self._consecutive_timeouts = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._state = "CLOSED"
+            self._consecutive_timeouts = 0
+            self._opened_at = 0.0
+            self._trial_in_flight = False
+
 
 
 # RFC 1918 private-use IPv4 blocks; plaintext HTTP is admitted only for these and loopback.
@@ -99,6 +180,7 @@ class OpenJevClient:
         token: str | None = None,
         expected_identity: str | None = None,
         transport: Callable | None = None,
+        circuit_breaker: _CircuitBreaker | None = None,
     ) -> None:
         self.base_url = str(base_url or os.getenv("HERMES_REFLEX_OPENJEV_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         if not _endpoint_allowed(self.base_url):
@@ -118,6 +200,14 @@ class OpenJevClient:
             expected_identity if expected_identity is not None else os.getenv("HERMES_REFLEX_OPENJEV_EXPECTED_IDENTITY") or ""
         ).strip()
         self._transport = transport or self._urllib_transport
+        self.circuit_breaker = circuit_breaker or _CircuitBreaker()
+
+    @property
+    def circuit_state(self) -> str:
+        return self.circuit_breaker.state
+
+    def reset_circuit(self) -> None:
+        self.circuit_breaker.reset()
 
     @staticmethod
     def _urllib_transport(url: str, headers: dict[str, str], body: bytes, timeout: float):
@@ -163,11 +253,20 @@ class OpenJevClient:
     def system_one(self, *, state: Any, questions: dict[str, dict[str, Any]], model: str | None = None) -> OpenJevResponse:
         if not isinstance(questions, dict) or not questions:
             raise OpenJevError("At least one question is required")
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.before_request()
         requested_model = str(model or self.model)
         payload = {"state": state, "questions": questions, "model": requested_model}
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
         started = time.monotonic()
-        raw_result = self._transport(self.base_url + DEFAULT_PATH, self._headers(), body, self.timeout)
+        try:
+            raw_result = self._transport(self.base_url + DEFAULT_PATH, self._headers(), body, self.timeout)
+        except Exception as exc:
+            if self.circuit_breaker is not None:
+                self.circuit_breaker.record_failure(exc)
+            raise
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.record_success()
         latency_ms = (time.monotonic() - started) * 1000.0
         if not isinstance(raw_result, tuple) or len(raw_result) not in {2, 3}:
             raise OpenJevError("OpenJev transport returned an invalid response tuple")

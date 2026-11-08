@@ -521,3 +521,45 @@ class OutcomeLearningTests(unittest.TestCase):
             prob, samples = model.predict({"decision_type": "RECOVERY"})
             self.assertEqual(samples, 3)
             self.assertGreater(prob, 0.5)
+
+    def test_assessment_state_payload_bounding_within_max_chars(self):
+        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)
+        state = nervous.TurnState(
+            turn_id="t-bound",
+            session_id="s-bound",
+            user_message_hash="hash",
+            admission="ON",
+        )
+        huge_text = "A" * 20000
+        event = {
+            "type": "TOOL_RESULT",
+            "event_id": "e-huge",
+            "tool_name": "search_files",
+            "state": {
+                "args": {"pattern": "needle", "bulk_content": huge_text},
+                "result_preview": huge_text,
+            },
+        }
+        bounded = sys._assessment_state(state, event)
+        raw_json = json.dumps(bounded, separators=(",", ":"))
+        self.assertLessEqual(len(raw_json), nervous.MAX_ASSESSMENT_STATE_CHARS)
+        self.assertEqual(bounded["turn"]["turn_id"], "t-bound")
+        self.assertEqual(bounded["event"]["type"], "TOOL_RESULT")
+
+    def test_do_assessment_catches_circuit_open_and_fails_open(self):
+        from hermes_nerve.reflex.openjev import OpenJevCircuitOpenError
+
+        ScriptedEngine.reset(OpenJevCircuitOpenError("OpenJev circuit breaker is OPEN (3 consecutive timeouts; 58.0s cooldown remaining)"))
+        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(sys, "_log_path", return_value=Path(td) / "events.jsonl"):
+                tid = sys.start_turn(user_message="Implement feature", session_id="s1")
+                # Wait briefly or synchronously invoke _do_assessment
+                payload = {
+                    "turn_id": tid,
+                    "event": {"type": "OBSERVATION", "event_id": "e1"},
+                    "router": {"reasons": ["test"], "score": 1.0},
+                }
+                # Should not raise exception
+                sys._do_assessment(payload)
+                self.assertEqual(sys._metrics["reflex_circuit_open_suppressed"], 1)
