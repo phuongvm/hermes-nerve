@@ -359,9 +359,10 @@ def requested_paths(user_message: str) -> tuple[str, ...]:
 
 
 def _shell_segments(command: str) -> list[str]:
+    """Split command string into shell segments using shlex for proper quote and escape handling."""
     # Split actual shell separators, never separators embedded in quoted code.
     lexer = shlex.shlex(str(command or ""), posix=True, punctuation_chars=";&|\n")
-    lexer.whitespace = " \t\r"
+    lexer.whitespace = " \t\r\n"
     lexer.whitespace_split = True
     segments, current = [], []
     try:
