@@ -1513,45 +1513,192 @@ class NervousSystem:
             if batch_payload is not None:
                 self._tasks.put(("assess", batch_payload, contextvars.copy_context()))
 
+    _PRIORITY_EVENT_KEYS = (
+        "event_id",
+        "turn_id",
+        "session_id",
+        "type",
+        "tool_name",
+        "origin_tool",
+        "origin_event_type",
+        "origin_event_id",
+        "origin_failure_fingerprint",
+        "status",
+        "risk",
+        "risk_reasons",
+        "materiality",
+        "uncertainty",
+        "novelty",
+        "consequence",
+        "contradiction",
+        "repeated_failure",
+        "deterministic_failure",
+        "deterministic_failure_reason",
+        "failure_repeat_count",
+        "failure_fingerprint",
+        "action_fingerprint",
+        "state_version",
+        "decision_version",
+        "hermes_decision",
+        "choices",
+        "goal",
+        "strategy",
+        "hypothesis",
+        "state",
+    )
+
+    @staticmethod
+    def _truncate_str(value: Any, limit: int) -> str:
+        text = str(value if value is not None else "")
+        if len(text) <= limit:
+            return text
+        if limit <= 14:
+            return text[: max(0, limit)]
+        return text[: limit - 14] + "...[truncated]"
+
+    @classmethod
+    def _truncate_nested(cls, value: Any, *, max_str: int = 300, max_items: int = 12, depth: int = 3) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return cls._truncate_str(value, max_str)
+        if depth <= 0:
+            return cls._truncate_str(value, max_str)
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for idx, (k, v) in enumerate(value.items()):
+                if idx >= max_items:
+                    out["_truncated_keys"] = len(value) - max_items
+                    break
+                key = cls._truncate_str(k, 80)
+                out[key] = cls._truncate_nested(v, max_str=max_str, max_items=max_items, depth=depth - 1)
+            return out
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            sliced = items[-max_items:] if len(items) > max_items else items
+            return [cls._truncate_nested(x, max_str=max_str, max_items=max_items, depth=depth - 1) for x in sliced]
+        return cls._truncate_str(value, max_str)
+
     def _bound_assessment_state(self, candidate: dict[str, Any], max_chars: int = MAX_ASSESSMENT_STATE_CHARS) -> dict[str, Any]:
         raw = json.dumps(candidate, separators=(",", ":"), default=str)
         if len(raw) <= max_chars:
             return candidate
 
-        event = dict(candidate.get("event") or {})
-        event_state = dict(event.get("state") or {}) if isinstance(event.get("state"), dict) else event.get("state")
+        turn_val = candidate.get("turn")
+        raw_turn: dict[str, Any] = dict(turn_val) if isinstance(turn_val, dict) else {}
+        bounded_turn = {
+            "turn_id": self._truncate_str(raw_turn.get("turn_id", ""), 128),
+            "admission": self._truncate_str(raw_turn.get("admission", ""), 32),
+            "events_seen": int(raw_turn.get("events_seen") or 0),
+            "provider_calls": int(raw_turn.get("provider_calls") or 0),
+        }
 
-        if isinstance(event_state, dict):
-            if "result_preview" in event_state:
-                event_state["result_preview"] = str(event_state["result_preview"])[:400] + "...[truncated]"
-            if "events" in event_state and isinstance(event_state["events"], list) and len(event_state["events"]) > 3:
-                event_state["events"] = event_state["events"][-3:]
-                event_state["batched_event_count_truncated"] = True
-            if "args" in event_state and isinstance(event_state["args"], dict):
-                bounded_args = {}
-                for k, v in event_state["args"].items():
-                    if isinstance(v, str) and len(v) > 300:
-                        bounded_args[k] = v[:300] + "...[truncated]"
-                    else:
-                        bounded_args[k] = v
-                event_state["args"] = bounded_args
-            event["state"] = event_state
-            candidate = dict(candidate)
-            candidate["event"] = event
-            raw = json.dumps(candidate, separators=(",", ":"), default=str)
-            if len(raw) <= max_chars:
-                return candidate
-
-        if isinstance(event, dict):
-            event = dict(event)
-            event["state"] = {
-                "truncated_by_bound": True,
-                "preview": str(event.get("state") or "")[:600] + "...[truncated]",
+        raw_ep = candidate.get("failure_episode")
+        bounded_episode = None
+        if isinstance(raw_ep, dict):
+            bounded_episode = {
+                "fingerprint": self._truncate_str(raw_ep.get("fingerprint", ""), 128),
+                "count": int(raw_ep.get("count") or 0),
+                "provider_evaluations": int(raw_ep.get("provider_evaluations") or 0),
+                "blocked_attempts": int(raw_ep.get("blocked_attempts") or 0),
+                "last_control": self._truncate_str(raw_ep.get("last_control", ""), 64),
             }
-            candidate = dict(candidate)
-            candidate["event"] = event
 
-        return candidate
+        types_val = candidate.get("recent_event_types")
+        raw_types: list[Any] = list(types_val) if isinstance(types_val, (list, tuple)) else []
+        bounded_recent_types = [self._truncate_str(x, 64) for x in raw_types[-12:]]
+
+        ev_val = candidate.get("event")
+        orig_event: dict[str, Any] = dict(ev_val) if isinstance(ev_val, dict) else {}
+        ordered_keys = [k for k in self._PRIORITY_EVENT_KEYS if k in orig_event] + [
+            k for k in orig_event if k not in self._PRIORITY_EVENT_KEYS
+        ]
+
+        # Pass 1: Recursive field bounding across all top-level and nested event fields
+        pass1_event: dict[str, Any] = {}
+        for idx, k in enumerate(ordered_keys):
+            if idx >= 28:
+                pass1_event["_truncated_keys"] = len(ordered_keys) - 28
+                break
+            key = self._truncate_str(k, 80)
+            val = orig_event[k]
+            if k == "state" and isinstance(val, dict):
+                st = dict(val)
+                if "result_preview" in st:
+                    st["result_preview"] = self._truncate_str(st["result_preview"], 414)
+                if "events" in st and isinstance(st["events"], list) and len(st["events"]) > 3:
+                    st["events"] = [
+                        self._truncate_nested(x, max_str=200, max_items=8, depth=2) for x in st["events"][-3:]
+                    ]
+                    st["batched_event_count_truncated"] = True
+                if "args" in st and isinstance(st["args"], dict):
+                    st["args"] = self._truncate_nested(st["args"], max_str=300, max_items=12, depth=3)
+                for sk in list(st.keys()):
+                    if sk not in {"result_preview", "events", "batched_event_count_truncated", "args"}:
+                        st[sk] = self._truncate_nested(st[sk], max_str=300, max_items=12, depth=2)
+                pass1_event[key] = st
+            else:
+                pass1_event[key] = self._truncate_nested(val, max_str=300, max_items=12, depth=3)
+
+        out = {
+            "turn": bounded_turn,
+            "event": pass1_event,
+            "failure_episode": bounded_episode,
+            "recent_event_types": bounded_recent_types,
+        }
+        if len(json.dumps(out, separators=(",", ":"), default=str)) <= max_chars:
+            return out
+
+        # Pass 2: Priority event keys only with compact strings and state summary
+        raw_state_preview = json.dumps(orig_event.get("state"), separators=(",", ":"), default=str)
+        pass2_event: dict[str, Any] = {}
+        for k in self._PRIORITY_EVENT_KEYS:
+            if k not in orig_event or k == "state":
+                continue
+            pass2_event[k] = self._truncate_nested(orig_event[k], max_str=120, max_items=6, depth=2)
+        pass2_event["state"] = {
+            "truncated_by_bound": True,
+            "preview": self._truncate_str(raw_state_preview, 600),
+        }
+        out["event"] = pass2_event
+        if len(json.dumps(out, separators=(",", ":"), default=str)) <= max_chars:
+            return out
+
+        # Pass 3: Hard structural envelope guaranteed <= max_chars
+        minimal_keys = (
+            "event_id",
+            "turn_id",
+            "session_id",
+            "type",
+            "tool_name",
+            "status",
+            "failure_fingerprint",
+            "action_fingerprint",
+        )
+        pass3_event: dict[str, Any] = {
+            k: self._truncate_str(orig_event[k], 64) for k in minimal_keys if k in orig_event
+        }
+        pass3_event["state"] = {"truncated_by_bound": True, "preview": ""}
+        out = {
+            "turn": bounded_turn,
+            "event": pass3_event,
+            "failure_episode": bounded_episode,
+            "recent_event_types": [self._truncate_str(x, 32) for x in bounded_recent_types[-6:]],
+        }
+        base_len = len(json.dumps(out, separators=(",", ":"), default=str))
+        budget = max(0, (max_chars - base_len) // 2)
+        if budget > 20:
+            pass3_event["state"]["preview"] = self._truncate_str(raw_state_preview, budget)
+            if len(json.dumps(out, separators=(",", ":"), default=str)) > max_chars:
+                pass3_event["state"]["preview"] = ""
+        if len(json.dumps(out, separators=(",", ":"), default=str)) > max_chars:
+            out["recent_event_types"] = [self._truncate_str(x, 16) for x in bounded_recent_types[-3:]]
+            out["event"] = {
+                "event_id": self._truncate_str(orig_event.get("event_id", ""), 32),
+                "type": self._truncate_str(orig_event.get("type", ""), 32),
+                "state": {"truncated_by_bound": True},
+            }
+        return out
 
     def _assessment_state(self, state: TurnState, event: dict[str, Any]) -> dict[str, Any]:
         failure_episode = None

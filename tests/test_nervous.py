@@ -523,43 +523,138 @@ class OutcomeLearningTests(unittest.TestCase):
             self.assertGreater(prob, 0.5)
 
     def test_assessment_state_payload_bounding_within_max_chars(self):
-        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)
-        state = nervous.TurnState(
-            turn_id="t-bound",
-            session_id="s-bound",
+        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)  # type: ignore[arg-type]
+        small_state = nervous.TurnState(
+            turn_id="t-small",
+            session_id="s-small",
             user_message_hash="hash",
             admission="ON",
         )
-        huge_text = "A" * 20000
-        event = {
+        small_event = {
             "type": "TOOL_RESULT",
-            "event_id": "e-huge",
-            "tool_name": "search_files",
-            "state": {
-                "args": {"pattern": "needle", "bulk_content": huge_text},
-                "result_preview": huge_text,
-            },
+            "event_id": "e-small",
+            "tool_name": "read_file",
+            "goal": "Read config",
+            "state": {"args": {"path": "config.yaml"}, "result_preview": "ok"},
         }
-        bounded = sys._assessment_state(state, event)
-        raw_json = json.dumps(bounded, separators=(",", ":"))
-        self.assertLessEqual(len(raw_json), nervous.MAX_ASSESSMENT_STATE_CHARS)
-        self.assertEqual(bounded["turn"]["turn_id"], "t-bound")
-        self.assertEqual(bounded["event"]["type"], "TOOL_RESULT")
+        unchanged = sys._assessment_state(small_state, small_event)
+        self.assertEqual(unchanged["event"], small_event)
+        self.assertLessEqual(
+            len(json.dumps(unchanged, separators=(",", ":"), default=str)),
+            nervous.MAX_ASSESSMENT_STATE_CHARS,
+        )
+
+        huge_text = "A" * 20000
+        adversarial_cases = [
+            (
+                "bulk_result_and_direct_arg",
+                nervous.TurnState(turn_id="t-bound", session_id="s-bound", user_message_hash="hash", admission="ON"),
+                {
+                    "type": "TOOL_RESULT",
+                    "event_id": "e-huge",
+                    "tool_name": "search_files",
+                    "state": {
+                        "args": {"pattern": "needle", "bulk_content": huge_text},
+                        "result_preview": huge_text,
+                    },
+                },
+            ),
+            (
+                "top_level_goal_and_many_custom_keys",
+                nervous.TurnState(turn_id="t-goal", session_id="s-goal", user_message_hash="hash", admission="ON"),
+                {
+                    "type": "DECISION",
+                    "event_id": "e-goal",
+                    "goal": "X" * 20000,
+                    "strategy": "Y" * 20000,
+                    "hypothesis": "Z" * 20000,
+                    "choices": ["C" * 5000 for _ in range(30)],
+                    **{f"custom_{i}": "V" * 5000 for i in range(40)},
+                    "state": {"args": {"nested_list": [["N" * 5000 for _ in range(25)]]}},
+                },
+            ),
+            (
+                "oversized_recent_event_type_and_episode",
+                self._make_oversized_turn_state(),
+                {
+                    "type": "FAILURE",
+                    "event_id": "e-fail",
+                    "failure_fingerprint": "fp-huge",
+                    "goal": "G" * 15000,
+                    "state": {"error": "E" * 15000, "result_preview": "R" * 15000},
+                },
+            ),
+            (
+                "oversized_batch_events",
+                nervous.TurnState(turn_id="t-batch", session_id="s-batch", user_message_hash="hash", admission="ON"),
+                {
+                    "type": "BATCH",
+                    "event_id": "e-batch",
+                    "goal": "B" * 12000,
+                    "state": {
+                        "batched_event_count": 20,
+                        "event_types": ["T" * 1000 for _ in range(20)],
+                        "events": [
+                            {"type": "TOOL_RESULT", "event_id": f"b-{i}", "goal": "G" * 4000, "state": {"out": "O" * 4000}}
+                            for i in range(20)
+                        ],
+                    },
+                },
+            ),
+            (
+                "non_dict_state_and_unicode",
+                nervous.TurnState(turn_id="t-uni", session_id="s-uni", user_message_hash="hash", admission="ON"),
+                {
+                    "type": "OBSERVATION",
+                    "event_id": "e-uni",
+                    "state": "🔥" * 15000,
+                },
+            ),
+        ]
+
+        for label, turn_state, ev in adversarial_cases:
+            with self.subTest(case=label):
+                bounded = sys._assessment_state(turn_state, ev)
+                raw_ascii = json.dumps(bounded, separators=(",", ":"), default=str)
+                raw_utf8 = json.dumps(bounded, separators=(",", ":"), ensure_ascii=False, default=str)
+                self.assertLessEqual(len(raw_ascii), nervous.MAX_ASSESSMENT_STATE_CHARS, f"{label} exceeded ASCII bound")
+                self.assertLessEqual(len(raw_utf8), nervous.MAX_ASSESSMENT_STATE_CHARS, f"{label} exceeded UTF-8 bound")
+                self.assertIn("turn", bounded)
+                self.assertIn("event", bounded)
+                self.assertIn("recent_event_types", bounded)
+
+    @staticmethod
+    def _make_oversized_turn_state() -> nervous.TurnState:
+        st = nervous.TurnState(
+            turn_id="U" * 5000,
+            session_id="S" * 5000,
+            user_message_hash="hash",
+            admission="W" * 2000,
+        )
+        for _ in range(15):
+            st.recent_events.append({"type": "T" * 20000})
+        st.failure_episodes["fp-huge"] = nervous.FailureEpisode(
+            fingerprint="F" * 10000,
+            action_fingerprint="A" * 10000,
+            count=4,
+            provider_evaluations=2,
+            blocked_attempts=1,
+            last_control="L" * 10000,
+        )
+        return st
 
     def test_do_assessment_catches_circuit_open_and_fails_open(self):
         from hermes_nerve.reflex.openjev import OpenJevCircuitOpenError
 
         ScriptedEngine.reset(OpenJevCircuitOpenError("OpenJev circuit breaker is OPEN (3 consecutive timeouts; 58.0s cooldown remaining)"))
-        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)
+        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
             with patch.object(sys, "_log_path", return_value=Path(td) / "events.jsonl"):
                 tid = sys.start_turn(user_message="Implement feature", session_id="s1")
-                # Wait briefly or synchronously invoke _do_assessment
                 payload = {
                     "turn_id": tid,
                     "event": {"type": "OBSERVATION", "event_id": "e1"},
                     "router": {"reasons": ["test"], "score": 1.0},
                 }
-                # Should not raise exception
                 sys._do_assessment(payload)
                 self.assertEqual(sys._metrics["reflex_circuit_open_suppressed"], 1)
