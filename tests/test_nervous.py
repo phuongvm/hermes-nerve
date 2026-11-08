@@ -610,6 +610,32 @@ class OutcomeLearningTests(unittest.TestCase):
                     "state": "🔥" * 15000,
                 },
             ),
+            (
+                "oversized_numeric_counters_3001_digits",
+                self._make_oversized_numeric_turn_state(10**3000),
+                {
+                    "type": "FAILURE",
+                    "event_id": "e-num-3000",
+                    "failure_fingerprint": "fp-num",
+                    "failure_repeat_count": 10**3000,
+                    "goal": "G" * 9000,
+                    "state": {
+                        "args": {"big_int": 10**3000, "neg_big_int": -(10**3000), "big_float": 1e300, "inf": float("inf")},
+                        "result_preview": "R" * 4000,
+                    },
+                },
+            ),
+            (
+                "oversized_numeric_counters_6001_digits_above_int_str_limit",
+                self._make_oversized_numeric_turn_state(10**6000),
+                {
+                    "type": "FAILURE",
+                    "event_id": "e-num-6000",
+                    "failure_fingerprint": "fp-num",
+                    "failure_repeat_count": 10**6000,
+                    "state": {"args": {"huge_int": 10**6000}},
+                },
+            ),
         ]
 
         for label, turn_state, ev in adversarial_cases:
@@ -622,6 +648,38 @@ class OutcomeLearningTests(unittest.TestCase):
                 self.assertIn("turn", bounded)
                 self.assertIn("event", bounded)
                 self.assertIn("recent_event_types", bounded)
+                self._assert_scalars_bounded(bounded)
+
+    def _assert_scalars_bounded(self, node: object) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                self.assertLessEqual(len(str(k)), 128)
+                self._assert_scalars_bounded(v)
+        elif isinstance(node, list):
+            for item in node:
+                self._assert_scalars_bounded(item)
+        elif isinstance(node, int) and not isinstance(node, bool):
+            self.assertLessEqual(abs(node), nervous.NervousSystem._MAX_SCALAR_INT)
+
+    @staticmethod
+    def _make_oversized_numeric_turn_state(huge_int: int) -> nervous.TurnState:
+        st = nervous.TurnState(
+            turn_id="t-num",
+            session_id="s-num",
+            user_message_hash="hash",
+            admission="ON",
+            events_seen=huge_int,
+            provider_calls=huge_int,
+        )
+        st.failure_episodes["fp-num"] = nervous.FailureEpisode(
+            fingerprint="fp-num",
+            action_fingerprint="act-num",
+            count=huge_int,
+            provider_evaluations=huge_int,
+            blocked_attempts=huge_int,
+            last_control="REPLAN",
+        )
+        return st
 
     @staticmethod
     def _make_oversized_turn_state() -> nervous.TurnState:

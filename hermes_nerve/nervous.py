@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import math
 import os
 import queue
 import re
@@ -1547,9 +1548,42 @@ class NervousSystem:
         "state",
     )
 
-    @staticmethod
-    def _truncate_str(value: Any, limit: int) -> str:
-        text = str(value if value is not None else "")
+    _MAX_SCALAR_INT = 9_007_199_254_740_991  # IEEE-754 / RFC 8259 MAX_SAFE_INTEGER (2^53 - 1)
+    _MAX_COUNTER_INT = 999_999_999
+
+    @classmethod
+    def _bound_int(cls, value: Any, *, min_val: int = 0, max_val: int = _MAX_COUNTER_INT) -> int:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            if value < min_val:
+                return min_val
+            if value > max_val:
+                return max_val
+            return value
+        try:
+            parsed = int(value or 0)
+        except Exception:
+            return max(min_val, min(max_val, 0))
+        if parsed < min_val:
+            return min_val
+        if parsed > max_val:
+            return max_val
+        return parsed
+
+    @classmethod
+    def _truncate_str(cls, value: Any, limit: int) -> str:
+        if isinstance(value, int) and not isinstance(value, bool):
+            if value < -cls._MAX_SCALAR_INT or value > cls._MAX_SCALAR_INT:
+                sign = "-" if value < 0 else ""
+                text = f"{sign}<int:{value.bit_length()}b>"
+            else:
+                text = str(value)
+        else:
+            try:
+                text = str(value if value is not None else "")
+            except Exception:
+                text = f"<{type(value).__name__}:oversized>"
         if len(text) <= limit:
             return text
         if limit <= 14:
@@ -1557,9 +1591,23 @@ class NervousSystem:
         return text[: limit - 14] + "...[truncated]"
 
     @classmethod
+    def _bound_scalar(cls, value: Any, max_str: int) -> Any:
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return cls._bound_int(value, min_val=-cls._MAX_SCALAR_INT, max_val=cls._MAX_SCALAR_INT)
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return str(value)
+            if abs(value) <= 1e15:
+                return round(value, 6)
+            return cls._truncate_str(f"{value:.6e}", min(max_str, 32))
+        return cls._truncate_str(value, max_str)
+
+    @classmethod
     def _truncate_nested(cls, value: Any, *, max_str: int = 300, max_items: int = 12, depth: int = 3) -> Any:
         if value is None or isinstance(value, (bool, int, float)):
-            return value
+            return cls._bound_scalar(value, max_str)
         if isinstance(value, str):
             return cls._truncate_str(value, max_str)
         if depth <= 0:
@@ -1568,7 +1616,7 @@ class NervousSystem:
             out: dict[str, Any] = {}
             for idx, (k, v) in enumerate(value.items()):
                 if idx >= max_items:
-                    out["_truncated_keys"] = len(value) - max_items
+                    out["_truncated_keys"] = cls._bound_int(len(value) - max_items, min_val=0)
                     break
                 key = cls._truncate_str(k, 80)
                 out[key] = cls._truncate_nested(v, max_str=max_str, max_items=max_items, depth=depth - 1)
@@ -1579,9 +1627,52 @@ class NervousSystem:
             return [cls._truncate_nested(x, max_str=max_str, max_items=max_items, depth=depth - 1) for x in sliced]
         return cls._truncate_str(value, max_str)
 
+    @classmethod
+    def _has_unbounded_scalar(cls, value: Any, *, depth: int = 6) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value < -cls._MAX_SCALAR_INT or value > cls._MAX_SCALAR_INT
+        if isinstance(value, float):
+            return not math.isfinite(value) or abs(value) > 1e15
+        if isinstance(value, str):
+            return False
+        if depth <= 0:
+            return True
+        if isinstance(value, dict):
+            if len(value) > 28:
+                return True
+            return any(
+                cls._has_unbounded_scalar(k, depth=depth - 1) or cls._has_unbounded_scalar(v, depth=depth - 1)
+                for k, v in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            if len(value) > 12:
+                return True
+            return any(cls._has_unbounded_scalar(x, depth=depth - 1) for x in value)
+        return False
+
+    @classmethod
+    def _safe_json_len(cls, payload: Any) -> int:
+        if cls._has_unbounded_scalar(payload):
+            return MAX_ASSESSMENT_STATE_CHARS + 1
+        try:
+            raw_ascii = json.dumps(
+                payload, separators=(",", ":"), allow_nan=False, default=lambda o: cls._truncate_str(o, 120)
+            )
+            raw_utf8 = json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=lambda o: cls._truncate_str(o, 120),
+            )
+            return max(len(raw_ascii), len(raw_utf8))
+        except Exception:
+            return MAX_ASSESSMENT_STATE_CHARS + 1
+
     def _bound_assessment_state(self, candidate: dict[str, Any], max_chars: int = MAX_ASSESSMENT_STATE_CHARS) -> dict[str, Any]:
-        raw = json.dumps(candidate, separators=(",", ":"), default=str)
-        if len(raw) <= max_chars:
+        if self._safe_json_len(candidate) <= max_chars:
             return candidate
 
         turn_val = candidate.get("turn")
@@ -1589,8 +1680,8 @@ class NervousSystem:
         bounded_turn = {
             "turn_id": self._truncate_str(raw_turn.get("turn_id", ""), 128),
             "admission": self._truncate_str(raw_turn.get("admission", ""), 32),
-            "events_seen": int(raw_turn.get("events_seen") or 0),
-            "provider_calls": int(raw_turn.get("provider_calls") or 0),
+            "events_seen": self._bound_int(raw_turn.get("events_seen"), min_val=0, max_val=self._MAX_COUNTER_INT),
+            "provider_calls": self._bound_int(raw_turn.get("provider_calls"), min_val=0, max_val=self._MAX_COUNTER_INT),
         }
 
         raw_ep = candidate.get("failure_episode")
@@ -1598,9 +1689,13 @@ class NervousSystem:
         if isinstance(raw_ep, dict):
             bounded_episode = {
                 "fingerprint": self._truncate_str(raw_ep.get("fingerprint", ""), 128),
-                "count": int(raw_ep.get("count") or 0),
-                "provider_evaluations": int(raw_ep.get("provider_evaluations") or 0),
-                "blocked_attempts": int(raw_ep.get("blocked_attempts") or 0),
+                "count": self._bound_int(raw_ep.get("count"), min_val=0, max_val=self._MAX_COUNTER_INT),
+                "provider_evaluations": self._bound_int(
+                    raw_ep.get("provider_evaluations"), min_val=0, max_val=self._MAX_COUNTER_INT
+                ),
+                "blocked_attempts": self._bound_int(
+                    raw_ep.get("blocked_attempts"), min_val=0, max_val=self._MAX_COUNTER_INT
+                ),
                 "last_control": self._truncate_str(raw_ep.get("last_control", ""), 64),
             }
 
@@ -1618,7 +1713,7 @@ class NervousSystem:
         pass1_event: dict[str, Any] = {}
         for idx, k in enumerate(ordered_keys):
             if idx >= 28:
-                pass1_event["_truncated_keys"] = len(ordered_keys) - 28
+                pass1_event["_truncated_keys"] = self._bound_int(len(ordered_keys) - 28, min_val=0)
                 break
             key = self._truncate_str(k, 80)
             val = orig_event[k]
@@ -1640,17 +1735,20 @@ class NervousSystem:
             else:
                 pass1_event[key] = self._truncate_nested(val, max_str=300, max_items=12, depth=3)
 
-        out = {
+        out: dict[str, Any] = {
             "turn": bounded_turn,
             "event": pass1_event,
             "failure_episode": bounded_episode,
             "recent_event_types": bounded_recent_types,
         }
-        if len(json.dumps(out, separators=(",", ":"), default=str)) <= max_chars:
+        if self._safe_json_len(out) <= max_chars:
             return out
 
         # Pass 2: Priority event keys only with compact strings and state summary
-        raw_state_preview = json.dumps(orig_event.get("state"), separators=(",", ":"), default=str)
+        bounded_state_for_preview = self._truncate_nested(orig_event.get("state"), max_str=200, max_items=8, depth=2)
+        raw_state_preview = json.dumps(
+            bounded_state_for_preview, separators=(",", ":"), default=lambda o: self._truncate_str(o, 80)
+        )
         pass2_event: dict[str, Any] = {}
         for k in self._PRIORITY_EVENT_KEYS:
             if k not in orig_event or k == "state":
@@ -1661,7 +1759,7 @@ class NervousSystem:
             "preview": self._truncate_str(raw_state_preview, 600),
         }
         out["event"] = pass2_event
-        if len(json.dumps(out, separators=(",", ":"), default=str)) <= max_chars:
+        if self._safe_json_len(out) <= max_chars:
             return out
 
         # Pass 3: Hard structural envelope guaranteed <= max_chars
@@ -1685,17 +1783,31 @@ class NervousSystem:
             "failure_episode": bounded_episode,
             "recent_event_types": [self._truncate_str(x, 32) for x in bounded_recent_types[-6:]],
         }
-        base_len = len(json.dumps(out, separators=(",", ":"), default=str))
+        base_len = self._safe_json_len(out)
         budget = max(0, (max_chars - base_len) // 2)
         if budget > 20:
             pass3_event["state"]["preview"] = self._truncate_str(raw_state_preview, budget)
-            if len(json.dumps(out, separators=(",", ":"), default=str)) > max_chars:
+            if self._safe_json_len(out) > max_chars:
                 pass3_event["state"]["preview"] = ""
-        if len(json.dumps(out, separators=(",", ":"), default=str)) > max_chars:
+        if self._safe_json_len(out) > max_chars:
             out["recent_event_types"] = [self._truncate_str(x, 16) for x in bounded_recent_types[-3:]]
             out["event"] = {
                 "event_id": self._truncate_str(orig_event.get("event_id", ""), 32),
                 "type": self._truncate_str(orig_event.get("type", ""), 32),
+                "state": {"truncated_by_bound": True},
+            }
+        if self._safe_json_len(out) > max_chars:
+            out["failure_episode"] = None
+            out["recent_event_types"] = []
+            out["turn"] = {
+                "turn_id": self._truncate_str(bounded_turn.get("turn_id", ""), 16),
+                "admission": self._truncate_str(bounded_turn.get("admission", ""), 8),
+                "events_seen": self._bound_int(bounded_turn.get("events_seen"), min_val=0, max_val=999_999),
+                "provider_calls": self._bound_int(bounded_turn.get("provider_calls"), min_val=0, max_val=999_999),
+            }
+            out["event"] = {
+                "event_id": self._truncate_str(orig_event.get("event_id", ""), 16),
+                "type": self._truncate_str(orig_event.get("type", ""), 16),
                 "state": {"truncated_by_bound": True},
             }
         return out
@@ -1707,22 +1819,26 @@ class NervousSystem:
             episode = state.failure_episodes.get(fail_fp)
             if episode:
                 failure_episode = {
-                    "fingerprint": episode.fingerprint,
-                    "count": episode.count,
-                    "provider_evaluations": episode.provider_evaluations,
-                    "blocked_attempts": episode.blocked_attempts,
-                    "last_control": episode.last_control,
+                    "fingerprint": self._truncate_str(episode.fingerprint, 128),
+                    "count": self._bound_int(episode.count, min_val=0, max_val=self._MAX_COUNTER_INT),
+                    "provider_evaluations": self._bound_int(
+                        episode.provider_evaluations, min_val=0, max_val=self._MAX_COUNTER_INT
+                    ),
+                    "blocked_attempts": self._bound_int(
+                        episode.blocked_attempts, min_val=0, max_val=self._MAX_COUNTER_INT
+                    ),
+                    "last_control": self._truncate_str(episode.last_control, 64),
                 }
         candidate = {
             "turn": {
-                "turn_id": state.turn_id,
-                "admission": state.admission,
-                "events_seen": state.events_seen,
-                "provider_calls": state.provider_calls,
+                "turn_id": self._truncate_str(state.turn_id, 128),
+                "admission": self._truncate_str(state.admission, 32),
+                "events_seen": self._bound_int(state.events_seen, min_val=0, max_val=self._MAX_COUNTER_INT),
+                "provider_calls": self._bound_int(state.provider_calls, min_val=0, max_val=self._MAX_COUNTER_INT),
             },
             "event": event,
             "failure_episode": failure_episode,
-            "recent_event_types": [str(x.get("type") or "") for x in list(state.recent_events)[-12:]],
+            "recent_event_types": [self._truncate_str(x.get("type") or "", 64) for x in list(state.recent_events)[-12:]],
         }
         return self._bound_assessment_state(candidate)
 
