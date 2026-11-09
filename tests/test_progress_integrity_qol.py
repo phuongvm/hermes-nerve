@@ -94,6 +94,40 @@ class ProgressIntegrityQolTests(unittest.TestCase):
             with self.subTest(msg=msg):
                 self.assertTrue(change_required(msg))
 
+    def test_scheduled_cron_and_skill_scaffold_stripping(self):
+        from hermes_nerve.progress_integrity import verification_required
+
+        cron_with_skill = (
+            '[IMPORTANT: The user has invoked the "spark-email-triage" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\n\n'
+            'Fix and update tools/spark_mail/sentinel.py and patch SKILL.md and run regression tests.\n\n'
+            'The user has provided the following instruction alongside the skill invocation: '
+            '[IMPORTANT: You are running as a scheduled cron job. DELIVERY: Your final response will be automatically delivered to the user.]\n\n'
+            '[CURRENT RUN TIME: Monday, 2026-11-09 09:08 +07 (UTC+07:00)]\n'
+            'You are the Spark Mail Triage Sentinel for Commander Phuong.'
+        )
+        self.assertFalse(change_required(cron_with_skill))
+        self.assertFalse(verification_required(cron_with_skill))
+        self.assertEqual(requested_paths(cron_with_skill), ())
+
+        interactive_skill_readonly = (
+            '[IMPORTANT: The user has invoked the "spark-email-triage" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\n\n'
+            'Fix and update tools/spark_mail/sentinel.py and patch SKILL.md when needed.\n\n'
+            'The user has provided the following instruction alongside the skill invocation: '
+            'Check the inbox status and summarize unread counts.'
+        )
+        self.assertFalse(change_required(interactive_skill_readonly))
+        self.assertEqual(requested_paths(interactive_skill_readonly), ())
+
+        interactive_skill_coding = (
+            '[IMPORTANT: The user has invoked the "tdd" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\n\n'
+            'See docs/tests.md and docs/mocking.md for examples.\n\n'
+            'The user has provided the following instruction alongside the skill invocation: '
+            'Fix src/parser.py and run regression tests.'
+        )
+        self.assertTrue(change_required(interactive_skill_coding))
+        self.assertTrue(verification_required(interactive_skill_coding))
+        self.assertEqual(requested_paths(interactive_skill_coding), ("src/parser.py",))
+
     def test_bare_python_version_ranges_are_not_file_targets(self):
         targets = requested_paths(
             "Support Python 3.10-3.14 and 3.11-3.13; fix src/parser.py"

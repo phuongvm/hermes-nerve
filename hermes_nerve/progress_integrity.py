@@ -74,6 +74,7 @@ HARNESS_INSTRUCTION_MARKERS = (
     "agent instructions",
     "issue-thread interaction",
     "skills/paperclip/scripts/paperclip-upload-artifact.sh",
+    "[important: you are running as a scheduled cron job.",
 )
 
 # Path prefixes/segments that belong to the agent harness, not to the user's
@@ -149,6 +150,42 @@ SYSTEM_DELIVERY_RE = re.compile(
     r'^(?:\[IMPORTANT:\s*Background process\b|Nerve completion integrity check:\b|\[System\b|\[The user reacted\b)',
     re.IGNORECASE,
 )
+
+_SKILL_INVOCATION_PREFIX = "[important: the user has invoked the "
+_SINGLE_SKILL_MARKER = "the full skill content is loaded below.]"
+_SINGLE_SKILL_INSTRUCTION = "the user has provided the following instruction alongside the skill invocation: "
+_RUNTIME_NOTE = "\n\n[runtime note:"
+_BUNDLE_MARKER = " skill bundle,"
+_BUNDLE_USER_INSTRUCTION = "\nuser instruction: "
+_BUNDLE_FIRST_SKILL_BLOCK = "\n\n[loaded as part of the "
+_AUTO_LOAD_PREFIX = '[important: the "'
+_SKILL_DIR_NOTE_END = "then run them with the terminal tool using the absolute path."
+
+
+def _extract_task_message(user_message: str) -> str:
+    """Strip preloaded skill/bundle scaffolds so only the caller's instruction is classified."""
+    raw = str(user_message or "")
+    folded = raw.casefold()
+    if folded.startswith(_SKILL_INVOCATION_PREFIX):
+        if _BUNDLE_MARKER in folded:
+            idx = folded.find(_BUNDLE_USER_INSTRUCTION)
+            if idx < 0:
+                return ""
+            start = idx + len(_BUNDLE_USER_INSTRUCTION)
+            end = folded.find(_BUNDLE_FIRST_SKILL_BLOCK, start)
+            return raw[start:end].strip() if end >= 0 else raw[start:].strip()
+        if _SINGLE_SKILL_MARKER in folded:
+            idx = folded.rfind(_SINGLE_SKILL_INSTRUCTION)
+            if idx < 0:
+                return ""
+            start = idx + len(_SINGLE_SKILL_INSTRUCTION)
+            end = folded.find(_RUNTIME_NOTE, start)
+            return raw[start:end].strip() if end >= 0 else raw[start:].strip()
+    if folded.startswith(_AUTO_LOAD_PREFIX) and " skill is auto-loaded" in folded[:240]:
+        end = folded.rfind(_SKILL_DIR_NOTE_END)
+        if end >= 0:
+            return raw[end + len(_SKILL_DIR_NOTE_END):].strip()
+    return raw
 
 
 def harness_instructions_message(user_message: str) -> bool:
@@ -250,7 +287,7 @@ def read_only_audit_message(user_message: str) -> bool:
     also states an imperative change target, so genuine implementation work --
     including work that involves reading files first -- keeps its guard.
     """
-    text = str(user_message or "").casefold()
+    text = _extract_task_message(str(user_message or "")).casefold()
     if not text:
         return False
     if not any(marker in text for marker in READ_ONLY_MARKERS):
@@ -269,6 +306,11 @@ def change_required(user_message: str) -> bool:
         return False
     if harness_instructions_message(msg) or read_only_audit_message(msg):
         return False
+    msg = _extract_task_message(msg).strip()
+    if not msg or INTAKE_INVOCATION_RE.search(msg) or SYSTEM_DELIVERY_RE.search(msg):
+        return False
+    if harness_instructions_message(msg) or read_only_audit_message(msg):
+        return False
     # Strip negated change phrases ("do not fix", "never implement") and
     # determiner-noun readings ("the update", "a fix") before testing for a
     # change verb, so prose that merely mentions an update is not mistaken for
@@ -281,6 +323,9 @@ def change_required(user_message: str) -> bool:
 def verification_required(user_message: str) -> bool:
     msg = str(user_message or "").strip()
     if SYSTEM_DELIVERY_RE.search(msg) or harness_instructions_message(msg):
+        return False
+    msg = _extract_task_message(msg).strip()
+    if not msg or SYSTEM_DELIVERY_RE.search(msg) or harness_instructions_message(msg):
         return False
     return bool(VERIFY_REQUIRED_RE.search(msg))
 
@@ -313,10 +358,12 @@ IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", 
 
 def requested_paths(user_message: str) -> tuple[str, ...]:
     msg = str(user_message or "").strip()
-    if SYSTEM_DELIVERY_RE.search(msg):
+    if SYSTEM_DELIVERY_RE.search(msg) or harness_instructions_message(msg):
         return ()
     seen: list[str] = []
-    cleaned = str(user_message or "")
+    cleaned = _extract_task_message(str(user_message or ""))
+    if not cleaned.strip() or SYSTEM_DELIVERY_RE.search(cleaned.strip()) or harness_instructions_message(cleaned):
+        return ()
     # Uploaded instruction documents are inputs, not output edit targets.
     # Strip only transport-envelope lines; keep explicit paths in the task body.
     attachment_header = r"(?m)^\[The user sent a text document: [^\x0d\x0a]*\]\x0d?$"
