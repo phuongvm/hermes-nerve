@@ -1,0 +1,43 @@
+{
+  "sanitization": "Minimal historical derivative, not the original prompt. Preserve exact task wording except change slug -> example-topic. Omit operational context and retain only four classifier-relevant fragments. No original/sanitized byte parity claim.",
+  "context": "Change slug example-topic. Sole write ownership under new change directory. Schema tool fields: openspec_change_create requires change,title,summary,workdir. Record change metadata.",
+  "goal": "Execute /openspec-propose to create a complete, minimal, validated OpenSpec proposal package for example-topic from the approved exploration. Produce real proposal.md, design.md, delta specs, unchecked tasks, exploration linkage/snapshot and validation evidence. Documentation only; return paths/hash/validation for independent proposal review.",
+  "denial": "Nerve progress guard requires task-relevant implementation now. Read/search/test-only actions are paused; mutation tools remain available. A scratch or unrelated file will not clear the guard.",
+  "provenance": {
+    "parent_session": "20261117_195841_de6409",
+    "child_session": "20261117_205808_39032f",
+    "prompt_message": 595540,
+    "denial_message": 595639,
+    "original_prompt_canonical_sha256": "e1defd679466ca4ccef3f793b439abca8f68ac0ceea142bee6a0bc92478fc9c4",
+    "canonical_hash_encoding": "SHA256(json.dumps(prompt, sort_keys=True, separators=(comma,colon), ensure_ascii=False, default=str).encode(utf-8))",
+    "exploration_sha256": "4d9e0c1da0a8b3fbfd588128f2e18a8945075aa9912eebd3f8b97c3b3e1b9f8d",
+    "archived_probe_sha256": "f6ec6170dcc3e45c839a08b3d58fd77afc88eca560cd9eee374e5564f145ddae",
+    "source_commit": "323431b824c225eefd3d013f1d718d60e7b5b08e",
+    "git_source_sha256": {
+      "progress_integrity.py": "429357d7ef9d19f712b70e0949baaef43e64148325be060d6622d761e921b85d",
+      "nervous.py": "1d79a07ed4e81d16df9963793342f3bddbe17a0f2d9d8af0608b513c2fd067c1",
+      "privacy.py": "d9e69bca16ef0cf329359a864e88e49de6efa9131bb4b60da3fa5a4cf9219b9b"
+    },
+    "source_byte_relation": "Git LF blobs equal pinned checkout bytes after CRLF-to-LF conversion only; both digests retained. Historical incident binary parity remains unproven.",
+    "source_sha256": {
+      "progress_integrity.py": "886a328c28d0fedb2ff1ad80ada3f9f03e34a4bfef621c6c79fddbc0a2c52e5e",
+      "nervous.py": "ea80df61b4bf66d0975032be77b4a334456e6900560747c0b8ef00ad29200c9e",
+      "privacy.py": "c7be6058dca7454ab4b3eea41003f3c75425a5ac6e1c5b91e3e355e22e09b18f"
+    },
+    "stall": {
+      "timestamp": "2026-11-17T14:00:31.812690+00:00",
+      "tool_actions": 12,
+      "mutation_attempts": 0,
+      "relevant_mutation_attempts": 0,
+      "decision_id": "local-9f69d03aa017499593653bfbb3e5becb",
+      "source": "local-progress-stall",
+      "enforced_at": "2026-11-17T14:01:09.175912+00:00"
+    },
+    "limitations": [
+      "Source hashes pin reproduction sources, not independently archived incident binaries.",
+      "Sanitized fixture replay is not exact historical prompt replay.",
+      "AST seams replace constructor, logging, worker, risk labels and outcome sinks; not real hook/Gateway E2E.",
+      "Successful synthetic observations isolate progress; historical scheduling and concurrent completion order are not replayed."
+    ]
+  }
+}
