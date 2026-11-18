@@ -271,6 +271,7 @@ class TurnState:
     change_required: bool = False
     verification_required: bool = False
     requested_paths: tuple[str, ...] = ()
+    task_intent_disposition: str = "missing"
     tool_actions: int = 0
     mutation_attempts: int = 0
     relevant_mutation_attempts: int = 0
@@ -448,9 +449,24 @@ class NervousSystem:
                     return self._turns.get(mapped)
         return None
 
-    def start_turn(self, *, user_message: str, session_id: str = "", turn_id: str = "") -> str:
+    def start_turn(self, *, user_message: str, session_id: str = "", turn_id: str = "",
+                   parent_session_id: str = "", task_intent: Any = None) -> str:
         if not self._config.enabled:
             return turn_id or ""
+        intent_message = user_message
+        disposition = "missing" if task_intent is None else "invalid"
+        if task_intent is not None:
+            try:
+                from agent.delegation_context import current_task_intent
+            except ImportError:
+                disposition = "unsupported-host"
+            else:
+                # Object identity ties the hook value to the active native scope;
+                # a copied dataclass or dict is not host provenance.
+                current = current_task_intent(session_id, parent_session_id)
+                if current is not None and task_intent is current:
+                    intent_message = current.goal_text
+                    disposition = "trusted"
         self._ensure_worker()
         tid = str(turn_id or uuid.uuid4().hex)
         with self._lock:
@@ -460,9 +476,10 @@ class NervousSystem:
                 user_message_hash=canonical_hash(user_message),
                 recent_events=deque(maxlen=self._config.retain_recent_events),
                 pending_batch=deque(maxlen=self._config.retain_recent_events),
-                change_required=progress_change_required(user_message),
-                verification_required=progress_verification_required(user_message),
-                requested_paths=progress_requested_paths(user_message),
+                change_required=progress_change_required(intent_message),
+                verification_required=progress_verification_required(intent_message),
+                requested_paths=progress_requested_paths(intent_message),
+                task_intent_disposition=disposition,
             )
             self._turns[tid] = state
             if session_id:
@@ -1026,7 +1043,7 @@ class NervousSystem:
                 kind = tool_kind(tool_name, args)
                 if kind == "mutation":
                     state.mutation_attempts += 1
-                    if mutation_is_relevant(tool_name, args, state.requested_paths):
+                    if (state.task_intent_disposition != "trusted" or state.change_required) and mutation_is_relevant(tool_name, args, state.requested_paths):
                         state.relevant_mutation_attempts += 1
                 elif (kind == "test" and test_succeeded(status, kwargs.get("result") if kwargs.get("result") is not None else result, error_message)
                       and not test_result_masked(str((args or {}).get("command") or ""))):
@@ -2021,6 +2038,7 @@ class NervousSystem:
                 "provider_errors": state.provider_errors,
                 "watch_promotions": state.watch_promotions,
                 "change_required": state.change_required,
+                "task_intent_disposition": state.task_intent_disposition,
                 "verification_required": state.verification_required,
                 "requested_paths": list(state.requested_paths),
                 "tool_actions": state.tool_actions,
@@ -2209,6 +2227,8 @@ def pre_llm_call(**kwargs: Any) -> str | None:
         user_message=str(kwargs.get("user_message") or ""),
         session_id=str(kwargs.get("session_id") or ""),
         turn_id=str(kwargs.get("turn_id") or ""),
+        parent_session_id=str(kwargs.get("parent_session_id") or ""),
+        task_intent=kwargs.get("task_intent"),
     )
     if _default._config.emit_prompt_hint:
         return (

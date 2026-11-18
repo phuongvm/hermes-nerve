@@ -24,7 +24,7 @@ from typing import Any
 # patch"), while an imperative verb is either sentence-initial or follows a
 # conjunction/comma ("then fix the client"). So a change word preceded by a
 # determiner is a noun and is not evidence of mutation intent.
-_CHANGE_WORDS = r"fix|implement|modify|patch|repair|refactor|edit|update|change|rewrite"
+_CHANGE_WORDS = r"fix|implement|modify|patch|repair|refactor|edit|update|change|rewrite|create|write|generate"
 _CHANGE_VERBS = rf"(?:{_CHANGE_WORDS})"
 # "the/a/an/this/that/... <change word>" -> noun. Up to three modifier words may sit
 # between the determiner and the change word ("the configuration update", "my new
@@ -261,7 +261,7 @@ READ_ONLY_MARKERS = (
 # "the configuration update" is a noun phrase, so it does not match: the regex
 # requires the verb to be followed by its object.
 IMPERATIVE_CHANGE_RE = re.compile(
-    r"\b(?:fix|implement|modify|patch|repair|refactor|edit|update|change|rewrite)\b"
+    rf"\b{_CHANGE_VERBS}\b"
     r"\s+(?:the\s+|this\s+|that\s+|these\s+|those\s+)?"
     r"[a-z0-9_./-]{2,}",
     re.IGNORECASE,
@@ -279,6 +279,21 @@ _NEGATED_CHANGE_RE = re.compile(
 )
 
 
+def _unquoted_intent(text: str) -> str:
+    """Quoted examples are data; quoted filenames need no intent verbs."""
+    # Preserve the exact-envelope legacy policy for runtime receipts.
+    if "[important: background process " in text.casefold():
+        return text
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(
+        r'"[^"]*"|(?<!\w)\'[^\']*\'(?!\w)',
+        lambda match: match.group()[1:-1] if PATH_RE.fullmatch(match.group()[1:-1]) else " ",
+        text,
+    )
+    # A line-initial metadata label is a noun, not "change the slug".
+    return re.sub(r"(?im)^\s*change\s+slug\b[^.\n]*", " ", text)
+
+
 def read_only_audit_message(user_message: str) -> bool:
     """True when the turn explicitly declares itself a read-only audit/verification.
 
@@ -287,7 +302,7 @@ def read_only_audit_message(user_message: str) -> bool:
     also states an imperative change target, so genuine implementation work --
     including work that involves reading files first -- keeps its guard.
     """
-    text = _extract_task_message(str(user_message or "")).casefold()
+    text = _unquoted_intent(_extract_task_message(str(user_message or ""))).casefold()
     if not text:
         return False
     if not any(marker in text for marker in READ_ONLY_MARKERS):
@@ -301,7 +316,7 @@ def read_only_audit_message(user_message: str) -> bool:
 
 
 def change_required(user_message: str) -> bool:
-    msg = str(user_message or "").strip()
+    msg = _unquoted_intent(str(user_message or "")).strip()
     if INTAKE_INVOCATION_RE.search(msg) or SYSTEM_DELIVERY_RE.search(msg):
         return False
     if harness_instructions_message(msg) or read_only_audit_message(msg):

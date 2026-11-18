@@ -39,6 +39,62 @@ Hermes remains the reasoning and execution engine. Jev is not placed in front of
 - `post_llm_call` / `on_session_end`: close turn-scoped supervision.
 - `pre_tool_call`: legacy selective gate only.
 
+## Native assignment intent (Task 2.2)
+
+`pre_llm_call` forwards optional `task_intent` and `parent_session_id` to
+`NervousSystem.start_turn`. On compatible Hermes hosts, the consumer accepts the
+record only when it is the same object returned by
+`agent.delegation_context.current_task_intent(session_id, parent_session_id)`
+inside the active native assignment scope. The host accessor validates version,
+field types, identity binding and goal digest. Dictionaries, copied records,
+expired scopes and mismatched actor/parent identities do not establish provenance.
+This is cooperative in-process provenance, not a sandbox against arbitrary Python
+execution in the host and not a permission grant.
+
+For a trusted record, only `goal_text` supplies `change_required`,
+`verification_required` and `requested_paths`. Supporting context cannot add an
+output target or verification obligation. The original combined prompt remains
+available to admission and contributes its original telemetry hash; it is not
+replaced in the model-visible brief. Mutation relevance uses the goal-derived
+paths, and trusted non-output assignments receive no relevant-mutation credit.
+
+The deterministic change classifier recognizes create/write/generate requests,
+including document output after an audit. Quoted examples and fenced code are
+excluded from change-intent classification; quoted filenames remain usable as
+objects of an affirmative instruction. A line-initial `Change slug` label is
+metadata, not an imperative. Runtime background-receipt handling retains its
+legacy policy. These heuristics do not parse `TASK`/`CONTEXT` markers into trusted
+metadata.
+
+`status()` reports `task_intent_disposition`: `trusted`, `missing`, `invalid`, or
+`unsupported-host`. Missing/invalid provenance uses the complete legacy message;
+an unavailable host accessor reports `unsupported-host` and also uses legacy
+handling. An old host that omits metadata therefore requires no new API. A new
+host with an old plugin receives the old plugin's behavior, not these guarantees.
+
+A relevant write attempt is not successful output. With an explicit empty
+`changed_paths` report, completion remains blocked even after a relevant failed
+write; unrelated/context-only and scratch writes do not satisfy a named output
+target. This slice introduces no prerequisite allowance, PREPARING state,
+continuation retention, revocation protocol or exemption from independent guards.
+Those require subsequent implementation and integration proof.
+
+### Scoped verification
+
+Run from the Nerve worktree with a separate developer interpreter and
+`HERMES_TASK_INTENT_HOST` set to the compatible Hermes worktree:
+
+```text
+python -E -B -m pytest -o pythonpath=tests -q -p no:cacheprovider tests/test_task_intent_contract.py
+```
+
+The host fixture loads the actual `agent/delegation_context.py` from that explicit
+checkout and asserts its path, avoiding an already-imported live host module.
+Host-dependent cases skip when the variable is absent; such a run is not complete
+cross-repository proof. These tests cover native record production and the Nerve
+hook/observation/completion seams, not the full registered dispatch/Gateway E2E.
+Full-suite baseline failures must be reported separately from scoped proof.
+
 ## Provider seam
 
 All three transports implement the same System One contract:
