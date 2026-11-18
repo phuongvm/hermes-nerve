@@ -193,7 +193,8 @@ def test_same_assignment_retains_action_consumption_after_turn_end(host_intent, 
         assert intent_system.status(turn_id="next")["tool_actions"] == 1
 
 
-def test_exhausted_assignment_blocks_first_read_of_next_turn(host_intent, intent_system):
+@pytest.mark.parametrize("rotate", [False, True], ids=["same-segment", "new-segment"])
+def test_exhausted_assignment_blocks_first_read_of_next_turn(host_intent, intent_system, rotate):
     args = {"path": "notes.md"}
     with host_intent.native_task_intent(actor_session_id="child", parent_session_id="parent",
                                       goal="Write proposal.md.", context=None) as intent:
@@ -203,7 +204,12 @@ def test_exhausted_assignment_blocks_first_read_of_next_turn(host_intent, intent
             intent_system.observe_tool_call(tool_name="read_file", args=args, turn_id="initial",
                                             tool_call_id=f"read-{i}", status="ok", result="notes")
         intent_system.finish_turn(turn_id="initial")
+        if rotate:
+            host_intent.rebind_compressed_task_intent("child", "next-segment", "parent")
+            assert host_intent.current_task_intent("child", "parent") is None
+            kwargs.update(session_id="next-segment", task_intent=host_intent.current_task_intent("next-segment", "parent"))
         intent_system.start_turn(turn_id="continued", user_message="Continue.", **kwargs)
+        assert intent_system.status(turn_id="continued")["task_intent_disposition"] == "trusted"
         assert intent_system.status(turn_id="continued")["tool_actions"] == 12
         denial = intent_system.before_tool_call(turn_id="continued", tool_name="read_file", args=args)
         assert denial and denial["action"] == "block"
