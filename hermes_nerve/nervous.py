@@ -44,6 +44,7 @@ from .progress_integrity import (
     environment_action,
     environment_failure,
     mutation_is_relevant,
+    update_output_evidence,
     requested_paths as progress_requested_paths,
     test_succeeded,
     test_result_masked,
@@ -277,6 +278,8 @@ class TurnState:
     mutation_attempts: int = 0
     relevant_mutation_attempts: int = 0
     successful_relevant_mutations: int = 0
+    required_outputs: tuple[str, ...] = ()
+    produced_outputs: set[str] = field(default_factory=set)
     verified_test_passes: int = 0
     progress_challenge_issued: bool = False
     environment_failure_actions: deque = field(default_factory=lambda: deque(maxlen=8))
@@ -484,6 +487,7 @@ class NervousSystem:
                 verification_required=progress_verification_required(intent_message),
                 requested_paths=progress_requested_paths(intent_message),
                 task_intent_disposition=disposition, assignment_id=assignment_id,
+                required_outputs=progress_requested_paths(intent_message, produced_only=True) if disposition == "trusted" else (),
             )
             self._turns[tid] = state
             if session_id:
@@ -1003,7 +1007,8 @@ class NervousSystem:
     def observe_tool_call(self, **kwargs: Any) -> dict[str, Any]:
         tool_name = str(kwargs.get("tool_name") or "")
         status = str(kwargs.get("status") or "")
-        args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+        raw_args = kwargs.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
         if tool_name.strip().lower().startswith(("nerve_", "jev_")):
             event_id = str(kwargs.get("tool_call_id") or uuid.uuid4().hex)
             with self._lock:
@@ -1047,6 +1052,8 @@ class NervousSystem:
                 kind = tool_kind(tool_name, args)
                 if kind == "mutation":
                     state.mutation_attempts += 1
+                    if state.required_outputs and not is_failure and status.lower() in {"ok", "success", "passed"}:
+                        update_output_evidence(state.produced_outputs, state.required_outputs, tool_name, args)
                     if (state.task_intent_disposition != "trusted" or state.change_required) and mutation_is_relevant(tool_name, args, state.requested_paths):
                         state.relevant_mutation_attempts += 1
                         if not is_failure and status.lower() in {"ok", "success", "passed"}:
@@ -1941,6 +1948,11 @@ class NervousSystem:
             no_relevant_persisted = coding_change and relevant_persisted is False
             if trusted_output:
                 no_relevant_persisted = not state.successful_relevant_mutations or relevant_persisted is not True
+                if state.required_outputs:
+                    no_relevant_persisted = not all(
+                        target in state.produced_outputs and changed_paths_relevant(changed_paths, (target,))
+                        for target in state.required_outputs
+                    )
             missing_verification = (
                 coding_change and state.verification_required and state.verified_test_passes == 0
             )

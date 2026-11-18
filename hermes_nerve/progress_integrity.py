@@ -371,7 +371,7 @@ def looks_like_api_field(path: str) -> bool:
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp"})
 
-def requested_paths(user_message: str) -> tuple[str, ...]:
+def requested_paths(user_message: str, *, produced_only: bool = False) -> tuple[str, ...]:
     msg = str(user_message or "").strip()
     if SYSTEM_DELIVERY_RE.search(msg) or harness_instructions_message(msg):
         return ()
@@ -394,6 +394,9 @@ def requested_paths(user_message: str) -> tuple[str, ...]:
     cleaned = _unquoted_intent(cleaned)
     cleaned = re.sub(r"(?<=\w)\.(?=\s|$)", ";", cleaned)
     clauses = re.split(r"[;!?\n]|\b(?:then|but|instead)\b|,\s*(?=(?:and\s+)?(?:read|inspect|verify|check|" + _CHANGE_WORDS + r")\b)", cleaned, flags=re.I)
+    if produced_only:
+        clauses = [clause for clause in clauses if re.search(r"\b(?:create|write|generate)\b", NEGATED_CHANGE_RE.sub(" ", clause), re.I)]
+        cleaned = " ".join(clauses)
     if CHANGE_REQUIRED_RE.search(cleaned):
         cleaned = " ".join(clause for clause in clauses if change_required(clause))
     for match in PATH_RE.finditer(cleaned):
@@ -637,6 +640,25 @@ def mutation_paths(tool_name: str, args: dict[str, Any] | None = None) -> tuple[
                 if path and path not in paths:
                     paths.append(path)
     return tuple(paths[:32])
+
+
+def update_output_evidence(produced: set[str], required: tuple[str, ...], tool_name: str, args: dict[str, Any]) -> None:
+    """Fold a successful mutation into the latest evidence for named deliverables.
+
+    Unknown effects can retire evidence, never create it. Do not infer an output
+    from the old side of a rename or a deleted path in a multi-file patch.
+    """
+    name = tool_name.strip().lower().rsplit(":", 1)[-1]
+    touched = mutation_paths(tool_name, args)
+    produced.difference_update(target for target in required if not touched or changed_paths_relevant(touched, (target,)))
+    if name in {"move_file", "rename_file"}:
+        dest = args.get("destination") or args.get("dest")
+    elif name in {"write_file", "create_file", "edit_file", "replace_file", "fs_write", "fs_replace", "write", "edit", "patch", "patch_file"} and not args.get("patch"):
+        dest = args.get("path") or args.get("file_path") or args.get("file")
+    else:
+        return
+    if isinstance(dest, str):
+        produced.update(target for target in required if changed_paths_relevant([dest], (target,)))
 
 
 def mutation_is_relevant(tool_name: str, args: dict[str, Any] | None, requested: tuple[str, ...]) -> bool:

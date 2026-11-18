@@ -323,6 +323,19 @@ def test_no_edits_scoped_stop(goal, matching, should_nudge, host_intent, intent_
         assert bool(decision and decision["action"] == "continue") is should_nudge
 
 
+def test_each_named_deliverable_needs_current_output_evidence(host_intent, intent_system):
+    goal = "Generate proposal.md and design.md."
+    targets = ["proposal.md", "design.md"]
+    with host_intent.native_task_intent(actor_session_id="child", parent_session_id="parent", goal=goal, context=None):
+        intent_system.start_turn(user_message=goal, session_id="child", parent_session_id="parent", turn_id="two",
+                                 task_intent=host_intent.current_task_intent("child", "parent"))
+    for tool, path, blocked in [("write_file", targets[0], True), ("create_file", targets[1], False),
+                                ("delete_file", targets[0], True), ("write_file", targets[0], False)]:
+        intent_system.observe_tool_call(turn_id="two", tool_name=tool, args={"path": path}, status="ok", result="ok")
+        directive = intent_system.completion_gate(turn_id="two", changed_paths=targets)
+        assert (directive is not None and directive["action"] == "continue") if blocked else directive is None
+
+
 def test_classifier_import_resolves_worktree():
     assert Path(progress_integrity.__file__).resolve().parents[1] == Path(__file__).resolve().parents[1]
 

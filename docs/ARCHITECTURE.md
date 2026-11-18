@@ -74,7 +74,12 @@ host with an old plugin receives the old plugin's behavior, not these guarantees
 
 For a trusted output-producing assignment, the completion hook requires both a
 successful relevant mutation and a host `changed_paths` report containing a
-relevant path. A failed write counts only as an attempt. Neither a passing test
+relevant path. For explicitly named create/write/generate targets, each target
+must also have its own positive output evidence and appear in the host report.
+Successful removal or move-away retires earlier evidence for that path. An
+unknown mutation effect cannot establish positive output. Evidence is based on
+observed tool effects, not an independent filesystem inspection. A failed write
+counts only as an attempt. Neither a passing test
 nor an absent, empty or unrelated path report proves output. These checks apply
 when the host dispatches the hook. This slice introduces no allowance, PREPARING state,
 continuation retention, revocation protocol or exemption from independent guards.
