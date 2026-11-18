@@ -265,6 +265,64 @@ def test_output_attempt_is_not_completion(host_intent, intent_system, path, stat
     assert "Do not claim completion" in decision["message"]
 
 
+def test_mixed_read_then_create_with_article():
+    assert progress_integrity.change_required('Read-only audit first; create a report in proposal.md.')
+
+
+@pytest.mark.parametrize('goal,target', [
+    ('Create proposal.md.', 'proposal.md'),
+    ('Do not write proposal.md; instead create design.md.', 'design.md'),
+    ('Read inputs.md, then write "design.md".', 'design.md'),
+])
+def test_only_affirmative_output_path_counts(host_intent, intent_system, goal, target):
+    from hermes_nerve import nervous
+    with host_intent.native_task_intent(actor_session_id='child', parent_session_id='parent', goal=goal, context='Implement src/context.py.'):
+        nervous.pre_llm_call(user_message=goal, session_id='child', parent_session_id='parent', turn_id='paths',
+                             task_intent=host_intent.current_task_intent('child', 'parent'))
+    assert intent_system.status(turn_id='paths')['requested_paths'] == [target]
+    for path in ('src/context.py', 'scratch.py', target):
+        intent_system.observe_tool_call(tool_name='write_file', args={'path': path}, status='ok', result='written', turn_id='paths')
+    assert intent_system.status(turn_id='paths')['relevant_mutation_attempts'] == 1
+
+
+@pytest.mark.parametrize('evidence', [{}, {'changed_paths': []}, {'changed_paths': ['other.md']}, {'changed_paths': ['proposal.md']}])
+def test_failed_output_not_rescued_by_passing_test(host_intent, intent_system, evidence):
+    from hermes_nerve import nervous
+    goal = 'Write proposal.md and verify it.'
+    with host_intent.native_task_intent(actor_session_id='child', parent_session_id='parent', goal=goal, context=None):
+        nervous.pre_llm_call(user_message=goal, session_id='child', parent_session_id='parent', turn_id='failed',
+                             task_intent=host_intent.current_task_intent('child', 'parent'))
+    intent_system.observe_tool_call(tool_name='write_file', args={'path': 'proposal.md'}, status='error', result='write failed', turn_id='failed')
+    intent_system.observe_tool_call(tool_name='pytest', args={}, status='passed', result='1 passed', turn_id='failed')
+    assert intent_system.status(turn_id='failed')['verified_test_passes'] == 1
+    decision = intent_system.completion_gate(turn_id='failed', coding=True, **evidence)
+    assert decision and decision['action'] == 'continue'
+
+
+def test_successful_output_with_matching_host_evidence_can_finish(host_intent, intent_system):
+    goal = 'Write proposal.md and verify it.'
+    with host_intent.native_task_intent(actor_session_id='child', parent_session_id='parent', goal=goal, context=None):
+        intent_system.start_turn(user_message=goal, session_id='child', parent_session_id='parent', turn_id='done',
+                                 task_intent=host_intent.current_task_intent('child', 'parent'))
+    intent_system.observe_tool_call(tool_name='write_file', args={'path': 'proposal.md'}, status='ok', result='written', turn_id='done')
+    intent_system.observe_tool_call(tool_name='pytest', args={}, status='passed', result='1 passed', turn_id='done')
+    assert intent_system.completion_gate(turn_id='done', coding=True, changed_paths=['proposal.md']) is None
+
+
+@pytest.mark.parametrize("goal,matching,should_nudge", [
+    ("Write proposal.md.", True, True), ("Summarize findings.", True, False),
+    ("Write proposal.md.", False, False),
+])
+def test_no_edits_scoped_stop(goal, matching, should_nudge, host_intent, intent_system):
+    from hermes_nerve import nervous
+    with host_intent.native_task_intent(actor_session_id="child", parent_session_id="parent", goal=goal, context=None):
+        record = host_intent.current_task_intent("child", "parent")
+        nervous.pre_llm_call(session_id="child", parent_session_id="parent", turn_id="attempt", user_message=goal, task_intent=record)
+        intent_system.observe_tool_call(turn_id="attempt", tool_name="write_file", args={"path": "proposal.md"}, status="error")
+        decision = nervous.pre_verify_no_edits(session_id="child", assignment_id=record.assignment_id if matching else "other", changed_paths=[])
+        assert bool(decision and decision["action"] == "continue") is should_nudge
+
+
 def test_classifier_import_resolves_worktree():
     assert Path(progress_integrity.__file__).resolve().parents[1] == Path(__file__).resolve().parents[1]
 

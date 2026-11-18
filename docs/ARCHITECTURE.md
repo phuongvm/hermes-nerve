@@ -72,10 +72,11 @@ an unavailable host accessor reports `unsupported-host` and also uses legacy
 handling. An old host that omits metadata therefore requires no new API. A new
 host with an old plugin receives the old plugin's behavior, not these guarantees.
 
-A relevant write attempt is not successful output. With an explicit empty
-`changed_paths` report, completion remains blocked even after a relevant failed
-write; unrelated/context-only and scratch writes do not satisfy a named output
-target. This slice introduces no prerequisite allowance, PREPARING state,
+For a trusted output-producing assignment, the completion hook requires both a
+successful relevant mutation and a host `changed_paths` report containing a
+relevant path. A failed write counts only as an attempt. Neither a passing test
+nor an absent, empty or unrelated path report proves output. These checks apply
+when the host dispatches the hook. This slice introduces no allowance, PREPARING state,
 continuation retention, revocation protocol or exemption from independent guards.
 Those require subsequent implementation and integration proof.
 

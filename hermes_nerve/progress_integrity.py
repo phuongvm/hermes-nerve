@@ -262,7 +262,7 @@ READ_ONLY_MARKERS = (
 # requires the verb to be followed by its object.
 IMPERATIVE_CHANGE_RE = re.compile(
     rf"\b{_CHANGE_VERBS}\b"
-    r"\s+(?:the\s+|this\s+|that\s+|these\s+|those\s+)?"
+    r"\s+(?:(?:a|an|the|this|that|these|those)\s+)?"
     r"[a-z0-9_./-]{2,}",
     re.IGNORECASE,
 )
@@ -274,7 +274,7 @@ IMPERATIVE_CHANGE_RE = re.compile(
 _NEGATED_CHANGE_RE = re.compile(
     r"(?:\bno\b|\bnot\b|\bwithout\b|\bnever\b|\bdon't\b|\bdo\s+not\b)"
     r"[^.;:!?\n]{0,40}?"
-    r"\b(?:fix|implement|modify|patch|repair|refactor|edit|update|change|rewrite|restart|delegat\w*)\b",
+    rf"\b(?:{_CHANGE_WORDS}|restart|delegat\w*)\b",
     re.IGNORECASE,
 )
 
@@ -389,6 +389,13 @@ def requested_paths(user_message: str) -> tuple[str, ...]:
     cleaned = re.sub(r"@?url:[^\s]+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"@?file:[^\s]+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"https?://[^\s`]+", "", cleaned, flags=re.IGNORECASE)
+    # Sentence punctuation is not part of a filename. Keep dots inside
+    # extensions, relative paths and dotted directory names intact.
+    cleaned = _unquoted_intent(cleaned)
+    cleaned = re.sub(r"(?<=\w)\.(?=\s|$)", ";", cleaned)
+    clauses = re.split(r"[;!?\n]|\b(?:then|but|instead)\b|,\s*(?=(?:and\s+)?(?:read|inspect|verify|check|" + _CHANGE_WORDS + r")\b)", cleaned, flags=re.I)
+    if CHANGE_REQUIRED_RE.search(cleaned):
+        cleaned = " ".join(clause for clause in clauses if change_required(clause))
     for match in PATH_RE.finditer(cleaned):
         raw = match.group(1)
         if re.fullmatch(r"v?\d+(?:\.\d+)+", raw, flags=re.IGNORECASE):

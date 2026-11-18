@@ -385,7 +385,10 @@ def _register_legacy(ctx):
         ctx.register_hook("post_tool_call", gate.post_tool_call)
     ctx.register_hook("pre_llm_call", _pre_llm)
     ctx.register_hook("transform_tool_result", _transform_tool_result)
-    ctx.register_hook("pre_verify", work_hooks.pre_verify if headless_worker else nervous.pre_verify)
+    if headless_worker:
+        ctx.register_hook("pre_verify", work_hooks.pre_verify)
+    else:
+        _register_nervous_verify(ctx)
     ctx.register_hook("post_api_request", work_hooks.post_api_request)
     ctx.register_hook("api_request_error", work_hooks.api_request_error)
     ctx.register_hook("post_llm_call", _post_llm)
@@ -740,7 +743,7 @@ def _register_profile(ctx):
     if headless_worker and policy.enabled("work_supervision"):
         ctx.register_hook("pre_verify",work_hooks.pre_verify)
     elif not headless_worker and policy.enabled("nervous"):
-        ctx.register_hook("pre_verify",nervous.pre_verify)
+        _register_nervous_verify(ctx)
     elif policy.enabled("work_supervision"):
         ctx.register_hook("pre_verify",work_hooks.pre_verify)
     if policy.enabled("work_supervision"):
@@ -829,6 +832,13 @@ def _record_runtime_activation(policy):
         os.replace(temporary, path)
     except OSError:
         logger.warning("Nerve effective-runtime snapshot could not be persisted")
+
+
+def _register_nervous_verify(ctx):
+    ctx.register_hook("pre_verify", nervous.pre_verify)
+    subscribe = getattr(ctx, "register_pre_verify_no_edits", None)
+    if callable(subscribe):
+        subscribe(nervous.pre_verify_no_edits)
 
 
 def register(ctx):

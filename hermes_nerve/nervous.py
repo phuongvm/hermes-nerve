@@ -272,9 +272,11 @@ class TurnState:
     verification_required: bool = False
     requested_paths: tuple[str, ...] = ()
     task_intent_disposition: str = "missing"
+    assignment_id: str = ""
     tool_actions: int = 0
     mutation_attempts: int = 0
     relevant_mutation_attempts: int = 0
+    successful_relevant_mutations: int = 0
     verified_test_passes: int = 0
     progress_challenge_issued: bool = False
     environment_failure_actions: deque = field(default_factory=lambda: deque(maxlen=8))
@@ -454,6 +456,7 @@ class NervousSystem:
         if not self._config.enabled:
             return turn_id or ""
         intent_message = user_message
+        assignment_id = ""
         disposition = "missing" if task_intent is None else "invalid"
         if task_intent is not None:
             try:
@@ -466,6 +469,7 @@ class NervousSystem:
                 current = current_task_intent(session_id, parent_session_id)
                 if current is not None and task_intent is current:
                     intent_message = current.goal_text
+                    assignment_id = current.assignment_id
                     disposition = "trusted"
         self._ensure_worker()
         tid = str(turn_id or uuid.uuid4().hex)
@@ -479,7 +483,7 @@ class NervousSystem:
                 change_required=progress_change_required(intent_message),
                 verification_required=progress_verification_required(intent_message),
                 requested_paths=progress_requested_paths(intent_message),
-                task_intent_disposition=disposition,
+                task_intent_disposition=disposition, assignment_id=assignment_id,
             )
             self._turns[tid] = state
             if session_id:
@@ -1045,6 +1049,8 @@ class NervousSystem:
                     state.mutation_attempts += 1
                     if (state.task_intent_disposition != "trusted" or state.change_required) and mutation_is_relevant(tool_name, args, state.requested_paths):
                         state.relevant_mutation_attempts += 1
+                        if not is_failure and status.lower() in {"ok", "success", "passed"}:
+                            state.successful_relevant_mutations += 1
                 elif (kind == "test" and test_succeeded(status, kwargs.get("result") if kwargs.get("result") is not None else result, error_message)
                       and not test_result_masked(str((args or {}).get("command") or ""))):
                     state.verified_test_passes += 1
@@ -1919,13 +1925,22 @@ class NervousSystem:
         state = self._resolve_turn(turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""))
         if state is None or state.admission not in {"ON", "WATCH"}:
             return None
+        if "no_edit_assignment_id" in kwargs and (
+            not self._config.enabled or state.finished or not state.change_required or
+            state.task_intent_disposition != "trusted" or not state.assignment_id or
+            state.assignment_id != kwargs["no_edit_assignment_id"]
+        ):
+            return None
         changed_paths_present = "changed_paths" in kwargs
         changed_paths = list(kwargs.get("changed_paths") or [])
-        coding_change = state.change_required and (bool(kwargs.get("coding")) or changed_paths_present)
+        trusted_output = state.task_intent_disposition == "trusted" and state.change_required
+        coding_change = trusted_output or (state.change_required and (bool(kwargs.get("coding")) or changed_paths_present))
         relevant_persisted = changed_paths_relevant(changed_paths, state.requested_paths) if changed_paths_present else None
         with self._lock:
             no_relevant_attempt = coding_change and state.relevant_mutation_attempts == 0
             no_relevant_persisted = coding_change and relevant_persisted is False
+            if trusted_output:
+                no_relevant_persisted = not state.successful_relevant_mutations or relevant_persisted is not True
             missing_verification = (
                 coding_change and state.verification_required and state.verified_test_passes == 0
             )
@@ -2253,6 +2268,10 @@ def transform_tool_result(**kwargs: Any) -> str | None:
         turn_id=str(kwargs.get("turn_id") or ""),
         session_id=str(kwargs.get("session_id") or ""),
     )
+
+
+def pre_verify_no_edits(*, assignment_id: str, session_id: str, **kwargs: Any) -> dict[str, str] | None:
+    return _default.completion_gate(session_id=session_id, no_edit_assignment_id=assignment_id, changed_paths=[])
 
 
 def pre_verify(**kwargs: Any) -> dict[str, str] | None:
