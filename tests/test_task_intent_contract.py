@@ -177,6 +177,39 @@ def test_native_hook_uses_only_bound_goal(host_intent, intent_system, goal, expe
     assert intent_system.status(turn_id="intent")["relevant_mutation_attempts"] == 0
 
 
+def test_same_assignment_retains_action_consumption_after_turn_end(host_intent, intent_system):
+    with host_intent.native_task_intent(actor_session_id="child", parent_session_id="parent",
+                                      goal="Write proposal.md.", context=None):
+        metadata = host_intent.current_task_intent("child", "parent")
+        def start(tid, message):
+            intent_system.start_turn(session_id="child", parent_session_id="parent", turn_id=tid,
+                                     task_intent=metadata, user_message=message)
+        start("first", "Write proposal.md.")
+        intent_system.observe_tool_call(tool_name="read_file", args={"path": "notes"},
+                                        status="ok", result="notes", turn_id="first")
+        assert intent_system.status(turn_id="first")["tool_actions"] == 1
+        intent_system.finish_turn(turn_id="first")
+        start("next", "Continue from the compacted summary.")
+        assert intent_system.status(turn_id="next")["tool_actions"] == 1
+
+
+def test_exhausted_assignment_blocks_first_read_of_next_turn(host_intent, intent_system):
+    args = {"path": "notes.md"}
+    with host_intent.native_task_intent(actor_session_id="child", parent_session_id="parent",
+                                      goal="Write proposal.md.", context=None) as intent:
+        kwargs = dict(session_id="child", parent_session_id="parent", task_intent=intent)
+        intent_system.start_turn(turn_id="initial", user_message="Write proposal.md.", **kwargs)
+        for i in range(12):
+            intent_system.observe_tool_call(tool_name="read_file", args=args, turn_id="initial",
+                                            tool_call_id=f"read-{i}", status="ok", result="notes")
+        intent_system.finish_turn(turn_id="initial")
+        intent_system.start_turn(turn_id="continued", user_message="Continue.", **kwargs)
+        assert intent_system.status(turn_id="continued")["tool_actions"] == 12
+        denial = intent_system.before_tool_call(turn_id="continued", tool_name="read_file", args=args)
+        assert denial and denial["action"] == "block"
+        assert "task-relevant implementation" in denial["message"]
+
+
 def test_forged_record_does_not_replace_legacy_goal(host_intent, intent_system):
     from hermes_nerve import nervous
     nervous.pre_llm_call(user_message="Implement src/parser.py and verify tests.",

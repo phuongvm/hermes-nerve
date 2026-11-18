@@ -24,6 +24,7 @@ import unicodedata
 import threading
 import time
 import uuid
+from weakref import WeakKeyDictionary
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -244,6 +245,18 @@ class FailureEpisode:
 
 
 @dataclass
+class AssignmentProgress:
+    """Consumption survives turns only for the same authenticated host record."""
+
+    tool_actions: int = 0
+    mutation_attempts: int = 0
+    relevant_mutation_attempts: int = 0
+    successful_relevant_mutations: int = 0
+    verified_test_passes: int = 0
+    produced_outputs: set[str] = field(default_factory=set)
+
+
+@dataclass
 class TurnState:
     turn_id: str
     session_id: str
@@ -274,13 +287,8 @@ class TurnState:
     requested_paths: tuple[str, ...] = ()
     task_intent_disposition: str = "missing"
     assignment_id: str = ""
-    tool_actions: int = 0
-    mutation_attempts: int = 0
-    relevant_mutation_attempts: int = 0
-    successful_relevant_mutations: int = 0
+    progress: AssignmentProgress = field(default_factory=AssignmentProgress)
     required_outputs: tuple[str, ...] = ()
-    produced_outputs: set[str] = field(default_factory=set)
-    verified_test_passes: int = 0
     progress_challenge_issued: bool = False
     environment_failure_actions: deque = field(default_factory=lambda: deque(maxlen=8))
 
@@ -292,6 +300,7 @@ class NervousSystem:
         self._lock = threading.RLock()
         self._turns: dict[str, TurnState] = {}
         self._session_turn: dict[str, str] = {}
+        self._assignment_progress: WeakKeyDictionary = WeakKeyDictionary()
         self._tasks: queue.Queue[tuple[str, dict[str, Any], contextvars.Context]] = queue.Queue(maxsize=128)
         self._worker: threading.Thread | None = None
         self._stopping = False
@@ -489,6 +498,11 @@ class NervousSystem:
                 task_intent_disposition=disposition, assignment_id=assignment_id,
                 required_outputs=progress_requested_paths(intent_message, produced_only=True) if disposition == "trusted" else (),
             )
+            if disposition == "trusted":
+                state.progress = self._assignment_progress.setdefault(task_intent, state.progress)
+                if (state.change_required and state.progress.tool_actions >= _PROGRESS_CHALLENGE_AFTER
+                        and not state.progress.relevant_mutation_attempts):
+                    self._activate_progress_stall_replan(state, tid)
             self._turns[tid] = state
             if session_id:
                 self._session_turn[str(session_id)] = tid
@@ -737,10 +751,10 @@ class NervousSystem:
         self._log(source.replace("-", "_"), {**directive.as_dict(), "repeat_count": episode.count})
 
     def _activate_progress_stall_replan(self, state: TurnState, event_id: str) -> None:
-        if state.progress_challenge_issued or state.relevant_mutation_attempts:
+        if state.progress_challenge_issued or state.progress.relevant_mutation_attempts:
             return
         decision_id = f"local-{uuid.uuid4().hex}"
-        reason = f"local-progress-stall:{state.tool_actions}-actions-without-relevant-mutation"
+        reason = f"local-progress-stall:{state.progress.tool_actions}-actions-without-relevant-mutation"
         directive = ControlDirective(
             decision_id=decision_id,
             event_id=event_id,
@@ -774,9 +788,9 @@ class NervousSystem:
         self._log("progress_stall_replan", {
             "turn_id": state.turn_id,
             "session_id": state.session_id,
-            "tool_actions": state.tool_actions,
-            "mutation_attempts": state.mutation_attempts,
-            "relevant_mutation_attempts": state.relevant_mutation_attempts,
+            "tool_actions": state.progress.tool_actions,
+            "mutation_attempts": state.progress.mutation_attempts,
+            "relevant_mutation_attempts": state.progress.relevant_mutation_attempts,
             "requested_paths": list(state.requested_paths),
             "decision_id": decision_id,
         })
@@ -1048,23 +1062,23 @@ class NervousSystem:
         state = self._resolve_turn(turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""))
         if state is not None:
             with self._lock:
-                state.tool_actions += 1
+                state.progress.tool_actions += 1
                 kind = tool_kind(tool_name, args)
                 if kind == "mutation":
-                    state.mutation_attempts += 1
+                    state.progress.mutation_attempts += 1
                     if state.required_outputs and not is_failure and status.lower() in {"ok", "success", "passed"}:
-                        update_output_evidence(state.produced_outputs, state.required_outputs, tool_name, args)
+                        update_output_evidence(state.progress.produced_outputs, state.required_outputs, tool_name, args)
                     if (state.task_intent_disposition != "trusted" or state.change_required) and mutation_is_relevant(tool_name, args, state.requested_paths):
-                        state.relevant_mutation_attempts += 1
+                        state.progress.relevant_mutation_attempts += 1
                         if not is_failure and status.lower() in {"ok", "success", "passed"}:
-                            state.successful_relevant_mutations += 1
+                            state.progress.successful_relevant_mutations += 1
                 elif (kind == "test" and test_succeeded(status, kwargs.get("result") if kwargs.get("result") is not None else result, error_message)
                       and not test_result_masked(str((args or {}).get("command") or ""))):
-                    state.verified_test_passes += 1
+                    state.progress.verified_test_passes += 1
                 if (
                     state.change_required
-                    and state.relevant_mutation_attempts == 0
-                    and state.tool_actions >= _PROGRESS_CHALLENGE_AFTER
+                    and state.progress.relevant_mutation_attempts == 0
+                    and state.progress.tool_actions >= _PROGRESS_CHALLENGE_AFTER
                     and not state.progress_challenge_issued
                 ):
                     self._activate_progress_stall_replan(state, event_id)
@@ -1944,17 +1958,17 @@ class NervousSystem:
         coding_change = trusted_output or (state.change_required and (bool(kwargs.get("coding")) or changed_paths_present))
         relevant_persisted = changed_paths_relevant(changed_paths, state.requested_paths) if changed_paths_present else None
         with self._lock:
-            no_relevant_attempt = coding_change and state.relevant_mutation_attempts == 0
+            no_relevant_attempt = coding_change and state.progress.relevant_mutation_attempts == 0
             no_relevant_persisted = coding_change and relevant_persisted is False
             if trusted_output:
-                no_relevant_persisted = not state.successful_relevant_mutations or relevant_persisted is not True
+                no_relevant_persisted = not state.progress.successful_relevant_mutations or relevant_persisted is not True
                 if state.required_outputs:
                     no_relevant_persisted = not all(
-                        target in state.produced_outputs and changed_paths_relevant(changed_paths, (target,))
+                        target in state.progress.produced_outputs and changed_paths_relevant(changed_paths, (target,))
                         for target in state.required_outputs
                     )
             missing_verification = (
-                coding_change and state.verification_required and state.verified_test_passes == 0
+                coding_change and state.verification_required and state.progress.verified_test_passes == 0
             )
             if no_relevant_attempt or no_relevant_persisted or missing_verification:
                 self._metrics["progress_false_completion_prevented"] += 1
@@ -1968,10 +1982,10 @@ class NervousSystem:
             self._log("progress_completion_blocked", {
                 "turn_id": state.turn_id,
                 "session_id": state.session_id,
-                "tool_actions": state.tool_actions,
-                "mutation_attempts": state.mutation_attempts,
-                "relevant_mutation_attempts": state.relevant_mutation_attempts,
-                "verified_test_passes": state.verified_test_passes,
+                "tool_actions": state.progress.tool_actions,
+                "mutation_attempts": state.progress.mutation_attempts,
+                "relevant_mutation_attempts": state.progress.relevant_mutation_attempts,
+                "verified_test_passes": state.progress.verified_test_passes,
                 "requested_paths": list(state.requested_paths),
                 "changed_paths": changed_paths,
                 "reason": reason,
@@ -2068,10 +2082,10 @@ class NervousSystem:
                 "task_intent_disposition": state.task_intent_disposition,
                 "verification_required": state.verification_required,
                 "requested_paths": list(state.requested_paths),
-                "tool_actions": state.tool_actions,
-                "mutation_attempts": state.mutation_attempts,
-                "relevant_mutation_attempts": state.relevant_mutation_attempts,
-                "verified_test_passes": state.verified_test_passes,
+                "tool_actions": state.progress.tool_actions,
+                "mutation_attempts": state.progress.mutation_attempts,
+                "relevant_mutation_attempts": state.progress.relevant_mutation_attempts,
+                "verified_test_passes": state.progress.verified_test_passes,
                 "progress_challenge_issued": state.progress_challenge_issued,
                 "pending_challenges": len(state.pending_challenges),
                 "pending_batch_events": len(state.pending_batch),
