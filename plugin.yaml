@@ -99,6 +99,8 @@ config_schema:
   nervous_emit_prompt_hint: {type: bool, default: false}
   nervous_local_learning: {type: bool, default: true}
   nervous_local_learning_min_samples: {type: int, default: 8}
+  prerequisite_max_operations: {type: int, default: 64, description: "Maximum prerequisite attempts per trusted assignment (1–128)."}
+  prerequisite_max_seconds: {type: int, default: 600, description: "Prerequisite lifetime in seconds (1–900)."}
   nervous_repeated_failure_local_replan_at: {type: int, default: 3}
   nervous_policy_memory_enabled: {type: bool, default: true, description: "Remember only runtime-wide unattended tool-policy blocks and reject them before execution."}
   nervous_policy_memory_ttl_seconds: {type: int, default: 3600, description: "TTL for runtime-wide tool-policy memory; runtime mode/config changes invalidate entries independently."}

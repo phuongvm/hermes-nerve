@@ -81,6 +81,12 @@ Supervision is scoped to the turn, not a wall-clock timeout. A two-hour turn wit
 
 `OutcomeStore` can record labeled decision outcomes. After `nervous_local_learning_min_samples`, a tiny local historical model can calibrate router sensitivity from observed usefulness. It does not add another remote LLM.
 
+## Prerequisite policy limits
+
+The operator settings `prerequisite_max_operations` and `prerequisite_max_seconds` default to 64 attempts and 600 seconds. They accept integers in the ranges 1–128 and 1–900, respectively. The effective limits are the lower of the operator and trusted host limits. An invalid operator value disables prerequisite eligibility and records `prerequisite_config_invalid` with the setting name, not the value. This does not turn off the ordinary progress guard.
+
+These settings define ceilings only. Host integration must reserve attempts before dispatch and treat exhausted or expired capacity as unavailable, without approving the call or resetting progress. Setting these values alone does not enable a prerequisite read.
+
 ## Privacy
 
 The nervous system should receive compact structured state rather than full transcripts. Tool-result previews are bounded by `nervous_event_preview_chars`, and existing recursive secret-redaction remains available at provider boundaries. Raw roleplay/chat transcripts are not required for event supervision.

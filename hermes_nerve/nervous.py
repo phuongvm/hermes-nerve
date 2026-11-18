@@ -145,8 +145,17 @@ def _deterministic_failure_reason(status: str, result: str, error_message: str) 
     return ""
 
 
+_PREREQUISITE_CONFIG = (("prerequisite_max_operations", 128), ("prerequisite_max_seconds", 900))
+
+
+def _valid_prerequisite_limit(value: Any, maximum: int) -> bool:
+    return type(value) is int and 1 <= value <= maximum
+
+
 @dataclass
 class NervousConfig:
+    prerequisite_max_operations: int = 64
+    prerequisite_max_seconds: int = 600
     enabled: bool = True
     admission_enabled: bool = True
     mode: str = "correct_next"
@@ -312,9 +321,27 @@ class NervousSystem:
         self._historical_model = HistoricalOutcomeModel(self._outcomes, self._config.local_learning_min_samples)
         self._policy_memory: PolicyMemory | None = None
 
+    def prerequisite_limits(self, operations: int, seconds: int) -> tuple[int, int] | None:
+        """Intersect the host ceilings and operator settings; do not reserve slots."""
+        with self._lock:
+            configured = tuple(getattr(self._config, key) for key, _ in _PREREQUISITE_CONFIG)
+            if not all(_valid_prerequisite_limit(value, maximum)
+                       for limits in (configured, (operations, seconds))
+                       for value, (_, maximum) in zip(limits, _PREREQUISITE_CONFIG)):
+                return None
+            return min(configured[0], operations), min(configured[1], seconds)
+
     def configure(self, **kwargs: Any) -> None:
         with self._lock:
             cfg = self._config
+            for key, maximum in _PREREQUISITE_CONFIG:
+                if key not in kwargs:
+                    continue
+                value = kwargs[key]
+                valid = _valid_prerequisite_limit(value, maximum)
+                setattr(cfg, key, value if valid else 0)
+                if not valid:
+                    self._log("prerequisite_config_invalid", {"setting": key})
             if "enabled" in kwargs:
                 cfg.enabled = bool(kwargs["enabled"])
             if "admission_enabled" in kwargs:
