@@ -147,7 +147,7 @@ def _nerve_hook_trace_sink(record):
         if str(__import__("os").getenv("NERVE_TRACE_DEBUG") or "") == "1":
             raise
 
-def _register_legacy(ctx):
+def _register_legacy(ctx, policy):
     is_kanban_worker = bool(
         str(os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_TASK_ID") or "").strip()
     )
@@ -220,8 +220,8 @@ def _register_legacy(ctx):
         semantic_enabled=ctx.get_config("selective_context_semantic_enabled", False),
     )
     nervous.configure(
-        prerequisite_max_operations=ctx.get_config("prerequisite_max_operations", 64),
-        prerequisite_max_seconds=ctx.get_config("prerequisite_max_seconds", 600),
+        prerequisite_max_operations=policy.get_config("prerequisite_max_operations", 64),
+        prerequisite_max_seconds=policy.get_config("prerequisite_max_seconds", 600),
         enabled=ctx.get_config("nervous_enabled", True),
         admission_enabled=ctx.get_config("nervous_turn_admission", True),
         mode=ctx.get_config("nervous_mode", "correct_next"),
@@ -861,7 +861,7 @@ def register(ctx):
     _warn_if_legacy_settings_ignored(ctx)
     policy = resolve_config(ctx.get_config)
     if policy.profile == "legacy":
-        result = _register_legacy(ctx)
+        result = _register_legacy(ctx, policy)
     else:
         result = _register_profile(ctx)
     _record_runtime_activation(policy)
