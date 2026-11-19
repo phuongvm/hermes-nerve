@@ -547,11 +547,11 @@ def test_learned_preference_auto_allows_after_enough_approvals():
     # escalation 1 -> operator approves -> success posts
     r1 = call(shape_cmd, tool_call_id="p1")
     assert r1 is not None
-    assert gate.post_tool_call(tool_call_id="p1", tool_name="terminal", result={}) is None
+    assert gate.post_tool_call(tool_call_id="p1", tool_name="terminal", status="ok", result={}) is None
     # escalation 2 -> approve -> post
     r2 = call(shape_cmd, tool_call_id="p2")
     assert r2 is not None
-    gate.post_tool_call(tool_call_id="p2", tool_name="terminal", result={})
+    gate.post_tool_call(tool_call_id="p2", tool_name="terminal", status="ok", result={})
     # third identical call: learned auto-allow, no interruption
     r3 = call(shape_cmd, tool_call_id="p3")
     assert r3 is None
@@ -571,11 +571,25 @@ def test_denied_calls_never_learn():
     assert call(cmd, tool_call_id="d2") is not None  # still escalates
 
 
+@pytest.mark.parametrize("outcome", [
+    {}, {"status": "blocked"}, {"status": "cancelled"}, {"status": "timeout"},
+    {"status": "error"}, {"status": "ok", "error_type": "tool_error"},
+    {"status": "ok", "error_message": "fixture error"},
+])
+def test_non_successful_outcomes_consume_pending_without_learning(outcome):
+    tool, call_id = "fixture_tool", "terminal-outcome"
+    shape = {"tool": tool}
+    preferences.remember_pending(call_id, "uncertain", tool, shape)
+    gate.post_tool_call(tool_call_id=call_id, tool_name=tool, result="{}", **outcome)
+    assert preferences.consume_pending(call_id) is None
+    assert preferences.approval_count("uncertain", tool, shape) == 0
+
+
 def test_consequential_class_is_never_learned():
     r1 = call("git push origin feature-x", tool_call_id="c1")
-    gate.post_tool_call(tool_call_id="c1", tool_name="terminal", result={})
+    gate.post_tool_call(tool_call_id="c1", tool_name="terminal", status="ok", result={})
     r2 = call("git push origin feature-x", tool_call_id="c2")
-    gate.post_tool_call(tool_call_id="c2", tool_name="terminal", result={})
+    gate.post_tool_call(tool_call_id="c2", tool_name="terminal", status="ok", result={})
     r3 = call("git push origin feature-x", tool_call_id="c3")
     assert r3 is not None, "publication approvals must NEVER be bypassed by learning"
 

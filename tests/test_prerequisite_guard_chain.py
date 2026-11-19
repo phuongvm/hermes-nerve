@@ -47,7 +47,12 @@ def chain(tmp_path, monkeypatch, request):
             raise verdict
         return verdict
 
-    monkeypatch.setattr(plugin.gate, "pre_tool_call", gate)
+    real_gate = getattr(request, "param", None) == "real-gate"
+    if real_gate:
+        monkeypatch.setenv("HERMES_NERVE_PREFERENCES", str(tmp_path / "preferences.json"))
+        monkeypatch.setenv("HERMES_NERVE_GATE_EVENTS", str(tmp_path / "gate-events.jsonl"))
+    else:
+        monkeypatch.setattr(plugin.gate, "pre_tool_call", gate)
     monkeypatch.setattr(plugin.work_hooks, "pre_tool_call", lambda **kw: control["work"])
     ctx = Ctx(tmp_path, {"nervous_turn_admission": False, "nervous_local_learning": False,
                          "nervous_policy_memory_enabled": False, "nervous_call_threshold": 1.0,
@@ -59,6 +64,8 @@ def chain(tmp_path, monkeypatch, request):
         if capability is not None:
             monkeypatch.setattr(ctx, "reserve_prerequisite_read", capability, raising=False)
     plugin.register(ctx)
+    if real_gate:
+        plugin.gate.configure(mode="enforce", scope="all", risk_preflight=True, learned_preferences=True)
     callbacks = [cb for event, cb in ctx.hooks if event == "pre_tool_call"]
     assert len(callbacks) == 1
     manager = plugins.PluginManager(str(tmp_path))
@@ -85,7 +92,7 @@ def chain(tmp_path, monkeypatch, request):
         try:
             yield SimpleNamespace(executor=executor, ctx=ctx, system=system, control=control, agent=agent,
                                   reservations=reservations, tool=tool, args=args, intent=intent,
-                                  gate_events=gate_events, manager=manager)
+                                  gate_events=gate_events, manager=manager, gate=plugin.gate)
         finally:
             system.configure(enabled=False)
     assert not provider_attempts
@@ -256,3 +263,34 @@ def test_cleanup_error_invalidates_the_ticket_and_preserves_veto(chain, monkeypa
     ledger = chain.reservations
     assert ledger.begin_read(chain.intent, "actor", "candidate", chain.tool, chain.args) == "replay"
     assert ledger.reserve_read(chain.intent, "actor", "fresh", chain.tool, chain.args) == "exhausted"
+
+
+@pytest.mark.parametrize("chain", ["real-gate"], indirect=True)
+def test_accepted_approval_does_not_learn_from_host_refusal(chain, monkeypatch):
+    from tools import approval
+
+    gate = chain.gate
+    assessment = gate.risk.assess_tool_call(chain.tool, chain.args)
+    assert assessment.category == gate.risk.UNCERTAIN
+    approvals = []
+    evaluations = []
+
+    def evaluate(**kwargs):
+        evaluations.append(kwargs["tool_name"])
+        return SimpleNamespace(value="APPROVAL", confidence=0.9, latency_ms=1.0,
+                               probabilities={"ALLOW": 0.05, "APPROVAL": 0.9, "BLOCK": 0.05})
+
+    def approve(tool, message, *, rule_key):
+        approvals.append((tool, rule_key))
+        return {"approved": True}
+
+    monkeypatch.setattr(gate, "evaluate_tool_call", evaluate)
+    monkeypatch.setattr(approval, "request_tool_approval", approve)
+    shape = (assessment.category, chain.tool, assessment.shape)
+    assert gate.prefs.approval_count(*shape) == 0
+    assert "verified reader unavailable" in dispatch(chain).lower()
+    assert evaluations == [chain.tool]
+    assert approvals == [(chain.tool, gate.prefs.scoped_rule_key(*shape))]
+    assert gate.prefs.consume_pending("candidate") is None
+    assert chain.system.status(turn_id="turn")["active_control"]["source"] == "local-progress-stall"
+    assert gate.prefs.approval_count(*shape) == 0

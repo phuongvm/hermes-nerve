@@ -848,7 +848,10 @@ def post_tool_call(**kwargs):
     entry = prefs.consume_pending(tool_call_id)
     if entry is None:
         return None
-    if kwargs.get("error") or kwargs.get("exception"):
+    # Approval is not a successful execution: another guard may still refuse dispatch.
+    if kwargs.get("status") != "ok" or any(
+        kwargs.get(field) for field in ("error", "exception", "error_type", "error_message")
+    ):
         return None
     result = kwargs.get("result")
     if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
