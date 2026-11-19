@@ -11,7 +11,7 @@ from tests.test_module_absence import Ctx, load_plugin
 
 
 @pytest.fixture
-def chain(tmp_path, monkeypatch):
+def chain(tmp_path, monkeypatch, request):
     source = os.environ.get("HERMES_TASK_INTENT_HOST")
     if not source:
         pytest.skip("Set HERMES_TASK_INTENT_HOST to the paired Hermes worktree")
@@ -52,6 +52,12 @@ def chain(tmp_path, monkeypatch):
     ctx = Ctx(tmp_path, {"nervous_turn_admission": False, "nervous_local_learning": False,
                          "nervous_policy_memory_enabled": False, "nervous_call_threshold": 1.0,
                          "prerequisite_max_operations": 1})
+    if getattr(request, "param", "current-host") != "old-host":
+        # Use the real, optional public method; the fake ctx supplies only settings/registration.
+        host_ctx = plugins.PluginContext(plugins.PluginManifest(name="nerve"), plugins.PluginManager(str(tmp_path)))
+        capability = getattr(host_ctx, "reserve_prerequisite_read", None)
+        if capability is not None:
+            monkeypatch.setattr(ctx, "reserve_prerequisite_read", capability, raising=False)
     plugin.register(ctx)
     callbacks = [cb for event, cb in ctx.hooks if event == "pre_tool_call"]
     assert len(callbacks) == 1
@@ -59,7 +65,8 @@ def chain(tmp_path, monkeypatch):
     manager._hooks["pre_tool_call"] = callbacks
     monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
     monkeypatch.setattr(lifecycle, "_observe", lambda *_a, **_kw: None)
-    monkeypatch.setattr(executor, "_emit_terminal_post_tool_call", lambda *_a, **_kw: None)
+    manager._hooks["post_tool_call"] = [cb for event, cb in ctx.hooks if event == "post_tool_call"]
+    assert plugin.nervous.post_tool_call in manager._hooks["post_tool_call"]
     fixture = runpy.run_path(str(host / "tests/tools/proposal_catalog_fixture.py"))
     planning = tmp_path / "planning"
     selection = catalog.freeze_proposal_catalog(fixture["CHANGE"], fixture["proposal_entry"](planning))
@@ -78,7 +85,7 @@ def chain(tmp_path, monkeypatch):
         try:
             yield SimpleNamespace(executor=executor, ctx=ctx, system=system, control=control, agent=agent,
                                   reservations=reservations, tool=tool, args=args, intent=intent,
-                                  gate_events=gate_events)
+                                  gate_events=gate_events, manager=manager)
         finally:
             system.configure(enabled=False)
     assert not provider_attempts
@@ -128,12 +135,19 @@ def test_registered_chain_preserves_downstream_authority(chain, monkeypatch, cas
         assert "action gate unavailable" in approvals[0][1]
     assert chain.reservations.reserve_read(chain.intent, "actor", "candidate", chain.tool, chain.args) == "replay"
     assert chain.reservations.begin_read(chain.intent, "actor", "candidate", chain.tool, chain.args) != "started"
-    assert chain.system.status(turn_id="turn")["active_control"]["source"] == "local-progress-stall"
-    assert chain.system.status(turn_id="turn")["tool_actions"] == 12
+    observed = chain.system.status(turn_id="turn")
+    assert observed["tool_actions"] == 13
+    if case in {"no-veto", "approval-accepted"}:
+        assert observed["active_control"]["source"] == "local-progress-stall"
+        assert "progress guard" in dispatch(chain, "next").lower()
+        assert chain.gate_events == ["candidate"]
+    else:
+        # A real independent refusal retains its existing post-tool semantics.
+        assert observed["active_control"]["source"] == "local-deterministic-failure"
 
 
 def test_new_bookkeeping_failure_blocks_without_exposing_exception(chain, monkeypatch):
-    def unavailable(*_args):
+    def unavailable(*_args, **_kwargs):
         raise RuntimeError("fixture confidential details")
 
     monkeypatch.setattr(chain.reservations, "reserve_read", unavailable)
@@ -177,8 +191,8 @@ def test_timed_out_callback_discards_its_late_ticket_without_refund(chain, monke
     discard = chain.reservations.discard_read
     reserved, release, settled = Event(), Event(), Event()
 
-    def pause_after_reservation(*args):
-        result = reserve(*args)
+    def pause_after_reservation(*args, **kwargs):
+        result = reserve(*args, **kwargs)
         if result == "reserved":
             reserved.set()
             if not release.wait(10):
@@ -203,3 +217,42 @@ def test_timed_out_callback_discards_its_late_ticket_without_refund(chain, monke
     request = (chain.intent, "actor", "candidate", chain.tool, chain.args)
     assert chain.reservations.begin_read(*request) == "replay"
     assert reserve(chain.intent, "actor", "fresh", chain.tool, chain.args) == "exhausted"
+
+
+@pytest.mark.parametrize("chain", ["old-host"], indirect=True)
+def test_missing_public_host_capability_keeps_the_progress_veto(chain):
+    assert "progress guard" in dispatch(chain).lower()
+    assert chain.gate_events == []
+    assert chain.reservations.reserve_read(chain.intent, "actor", "probe", chain.tool, chain.args) == "reserved"
+
+
+def test_public_capability_matches_only_the_current_host_call(chain):
+    reserve = chain.ctx.reserve_prerequisite_read
+    identity = dict(session_id="actor", assignment_id=chain.intent.assignment_id,
+                    tool_call_id="candidate", tool_name=chain.tool)
+    assert reserve(**identity) == "unavailable"
+    decisions = []
+
+    def probe(**_kwargs):
+        for field in identity:
+            decisions.append(reserve(**{**identity, field: "unrelated"}))
+
+    chain.manager._hooks["pre_tool_call"].insert(0, probe)
+    assert "verified reader unavailable" in dispatch(chain).lower()
+    assert decisions == ["unavailable"] * len(identity)
+    assert chain.gate_events == ["candidate"]
+    assert reserve(**identity) == "unavailable"
+
+
+def test_cleanup_error_invalidates_the_ticket_and_preserves_veto(chain, monkeypatch, caplog):
+    def broken_cleanup(*args, **kwargs):
+        raise RuntimeError("fixture private cleanup information")
+
+    chain.control["gate"] = {"action": "block", "message": "independent veto"}
+    monkeypatch.setattr(chain.reservations, "discard_read", broken_cleanup)
+    assert dispatch(chain) == "independent veto"
+    assert "prerequisite_ticket_cleanup_failed" in caplog.text
+    assert "fixture private cleanup information" not in caplog.text
+    ledger = chain.reservations
+    assert ledger.begin_read(chain.intent, "actor", "candidate", chain.tool, chain.args) == "replay"
+    assert ledger.reserve_read(chain.intent, "actor", "fresh", chain.tool, chain.args) == "exhausted"

@@ -346,7 +346,7 @@ def _register_legacy(ctx, policy):
     )
     if not headless_worker:
         _pre_tool_callbacks += (
-            ("nervous", nervous.pre_tool_call),
+            ("nervous", nervous.bind_pre_tool_call(ctx)),
             ("action_gate", gate.pre_tool_call, True),
         )
     _pre_tool_control = gate.instrument_pre_tool_chain(
@@ -671,7 +671,7 @@ def _register_profile(ctx):
     _pre_tool_callbacks=[]
     if policy.enabled("remote_workers"): _pre_tool_callbacks.append(("remote_workers", remote_control.pre_tool_call))
     if policy.enabled("work_supervision"): _pre_tool_callbacks.append(("work_supervision", work_hooks.pre_tool_call))
-    if not headless_worker and policy.enabled("nervous"): _pre_tool_callbacks.append(("nervous", nervous.pre_tool_call))
+    if not headless_worker and policy.enabled("nervous"): _pre_tool_callbacks.append(("nervous", nervous.bind_pre_tool_call(ctx)))
     if not headless_worker and policy.enabled("action_gate"): _pre_tool_callbacks.append(("action_gate", gate.pre_tool_call, True))
     _pre_tool_control=gate.instrument_pre_tool_chain(_pre_tool_callbacks,_nerve_hook_trace_sink)
 

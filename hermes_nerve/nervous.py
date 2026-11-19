@@ -1095,6 +1095,15 @@ class NervousSystem:
                 "origin_tool": tool_name,
                 "origin_event_id": event_id,
             }
+        if status == "blocked" and kwargs.get("error_type") == "prerequisite_reader_unavailable":
+            # The host refused dispatch. Count the observation, not a tool failure.
+            state = self._resolve_turn(
+                turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""),
+            )
+            if state is not None:
+                with self._lock:
+                    state.progress.tool_actions += 1
+            return {"accepted": True, "forwarded": False, "reason": "prerequisite_reader_unavailable"}
         risk, risk_reasons = infer_tool_risk(tool_name, status)
         result = str(kwargs.get("result") or "")
         error_message = str(kwargs.get("error_message") or "")
@@ -1238,7 +1247,7 @@ class NervousSystem:
             event["suppress_reason"] = "repeated-failure-dedup"
         return self.emit_event(event)
 
-    def before_tool_call(self, **kwargs: Any) -> dict[str, Any] | None:
+    def before_tool_call(self, *, reserve_prerequisite_read=None, **kwargs: Any) -> dict[str, Any] | None:
         """Local control-lease enforcement at Hermes' pre-tool execution seam.
 
         No provider call occurs here. This is the piece v0.2.0 lacked: a remote
@@ -1294,7 +1303,9 @@ class NervousSystem:
                 and tool_kind(tool_name, args) != "mutation"
             )
         if eligible:
-            reservation = self._reserve_progress_read(state, tool_name, args, kwargs.get("tool_call_id"))
+            reservation = self._reserve_progress_read(
+                reserve_prerequisite_read, state, tool_name, kwargs.get("tool_call_id"),
+            )
             if reservation == "error":
                 return {"action": "block", "message": "Nerve prerequisite bookkeeping unavailable; no read dispatched."}
             with self._lock:
@@ -1398,17 +1409,15 @@ class NervousSystem:
         return None
 
     @staticmethod
-    def _reserve_progress_read(state: TurnState, tool: str, args: dict, call_id: Any) -> str:
-        if not isinstance(call_id, str) or not call_id:
-            return "unavailable"
-        try:
-            from agent.prerequisite.guard import reserve_progress_read
-        except ImportError:
+    def _reserve_progress_read(reserve, state: TurnState, tool: str, call_id: Any) -> str:
+        if not callable(reserve) or not isinstance(call_id, str) or not call_id:
             return "unavailable"  # Older host: retain the progress veto.
         try:
-            return reserve_progress_read(state.session_id, state.assignment_id, call_id, tool, args)
+            decision = reserve(session_id=state.session_id, assignment_id=state.assignment_id,
+                               tool_call_id=call_id, tool_name=tool)
         except Exception:
             return "error"  # The composite treats uncaught nervous exceptions as advisory.
+        return decision if type(decision) is str else "error"
 
     def _do_assessment(self, payload: dict[str, Any]) -> None:
         tid = str(payload.get("turn_id") or "")
@@ -2362,6 +2371,17 @@ def pre_llm_call(**kwargs: Any) -> str | None:
 
 def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
     return _default.before_tool_call(**kwargs)
+
+
+def bind_pre_tool_call(ctx):
+    """Capture the optional host capability from plugin registration, not hook arguments."""
+    reserve = getattr(ctx, "reserve_prerequisite_read", None)
+
+    def bound(**kwargs):
+        kwargs["reserve_prerequisite_read"] = reserve
+        return pre_tool_call(**kwargs)
+
+    return bound
 
 
 def post_tool_call(**kwargs: Any) -> None:
