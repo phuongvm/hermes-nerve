@@ -74,6 +74,7 @@ def chain(tmp_path, monkeypatch, request):
     monkeypatch.setattr(lifecycle, "_observe", lambda *_a, **_kw: None)
     manager._hooks["post_tool_call"] = [cb for event, cb in ctx.hooks if event == "post_tool_call"]
     assert plugin.nervous.post_tool_call in manager._hooks["post_tool_call"]
+    manager._hooks["post_approval_response"] = [cb for event, cb in ctx.hooks if event == "post_approval_response"]
     fixture = runpy.run_path(str(host / "tests/tools/proposal_catalog_fixture.py"))
     planning = tmp_path / "planning"
     selection = catalog.freeze_proposal_catalog(fixture["CHANGE"], fixture["proposal_entry"](planning))
@@ -291,6 +292,91 @@ def test_accepted_approval_does_not_learn_from_host_refusal(chain, monkeypatch):
     assert "verified reader unavailable" in dispatch(chain).lower()
     assert evaluations == [chain.tool]
     assert approvals == [(chain.tool, gate.prefs.scoped_rule_key(*shape))]
-    assert gate.prefs.consume_pending("candidate") is None
+    assert gate.prefs.consume_pending(("actor", "turn", "candidate")) is None
     assert chain.system.status(turn_id="turn")["active_control"]["source"] == "local-progress-stall"
     assert gate.prefs.approval_count(*shape) == 0
+
+
+@pytest.mark.parametrize("case", ["started", "yielded", "exception", "other-rule", "completed"])
+@pytest.mark.parametrize("chain", ["real-gate"], indirect=True)
+def test_approval_learning_requires_completed_execution(chain, monkeypatch, tmp_path, case):
+    from model_tools import _approval_observability, _CallIds
+    from tools import approval, approval_context, approval_prompt, terminal_tool_result
+
+    gate = chain.gate
+    executor = chain.executor
+    args = {"command": "./scripts/fixture.sh", "workdir": str(tmp_path)}
+    ref = executor._ToolCallRef("terminal", args, "fixture-task", "terminal-fixture", [])
+    assessment = gate.risk.assess_tool_call(ref.name, args)
+    assert assessment.category == gate.risk.UNCERTAIN
+    approvals = []
+    monkeypatch.setattr(gate, "evaluate_tool_call", lambda **_: SimpleNamespace(
+        value="APPROVAL", confidence=0.9, latency_ms=1.0, probabilities={"APPROVAL": 0.9},
+    ))
+
+    def answer(_command, reason, **_kwargs):
+        approvals.append(reason)
+        return "once"
+
+    monkeypatch.setattr(approval, "_presence", lambda *_: (None, True, False, False))
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_context, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "prompt_dangerous_approval", answer)
+    monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", answer)
+    monkeypatch.setattr(approval, "is_approved", lambda *_: False)
+    if case == "other-rule":
+        chain.manager._hooks["pre_tool_call"].insert(0, lambda **_: {
+            "action": "approve", "message": "fixture separate rule", "rule_key": "other:rule",
+        })
+    # Exercise the normal gate without the fixture's unrelated progress stall.
+    chain.system.configure(enabled=False)
+    chain.agent.tool_progress_callback = None
+    monkeypatch.setattr(executor, "_begin_tool_execution", lambda *_: None)
+    monkeypatch.setattr(executor, "_run_with_activity_heartbeat", lambda _agent, _tool, run: run())
+    executions = []
+
+    def handler(final_args):
+        executions.append(final_args)
+        if case == "exception":
+            raise RuntimeError("fixture exception")
+        if case == "started":
+            return '{"output":"started","exit_code":0,"error":null,"session_id":"fixture"}'
+        if case == "yielded":
+            return '{"output":"pending","exit_code":null,"error":null,"status":"yielded_to_background"}'
+        with _approval_observability(_CallIds(ref.task_id, "actor", ref.call_id, "turn")):
+            return terminal_tool_result.finalize_foreground_result(
+                command=args["command"], result={"returncode": 0, "output": "fixture"},
+                env=SimpleNamespace(), env_type="local", effective_task_id=ref.task_id,
+                task_id=ref.task_id, session_id="actor", session_key="actor", workdir=args["workdir"],
+                command_cwd=args["workdir"], approval_note=None,
+            )
+
+    def run(_agent, **kwargs):
+        state = executor._ManagedToolResult(None, args, [], False, True)
+        state.result = executor._dispatch_authorized_once(
+            chain.agent, state, ref, execute=kwargs["execute"], scope_block=None,
+            display_index=None, begin_execution=None, authorization_gate=None,
+        )
+        return state
+
+    monkeypatch.setattr(executor, "_run_sequential_tool_execution_middleware", run)
+    monkeypatch.setattr(executor, "_commit_tool_result", lambda *_a, **_kw: None)
+    dispatch_plan = executor._SequentialDispatch(
+        execute=handler, error_result=lambda exc: f"Error executing tool 'terminal': {exc}",
+        error_log="Fixture tool %s raised: %s", finish_spinner=False,
+    )
+    messages = []
+    state, duration = executor._run_sequential_call(
+        chain.agent, dispatch_plan, ref, scope_block=None, messages=messages, remaining_calls=[],
+        display_index=1, tool_start_time=executor.time.time(),
+    )
+    assert not state.blocked
+    executor._publish_sequential_result(
+        chain.agent, messages, ref, state, tool_duration=duration, index=0, budget=None, transform_applied=True,
+    )
+    shape = (assessment.category, ref.name, assessment.shape)
+    assert executions == [args]
+    assert len(approvals) == 1
+    assert ("fixture separate rule" in approvals[0]) == (case == "other-rule")
+    assert gate.prefs.consume_pending(("actor", "turn", ref.call_id)) is None
+    assert gate.prefs.approval_count(*shape) == (1 if case == "completed" else 0)

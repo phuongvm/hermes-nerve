@@ -32,7 +32,7 @@ from typing import Any
 
 from .paths import hermes_home
 
-_SCHEMA = "hermes-nerve-preferences/v1"
+_SCHEMA = "hermes-nerve-preferences/v2"
 _LEARNABLE_CLASSES = frozenset({"uncertain"})
 
 
@@ -62,9 +62,9 @@ def _load() -> dict[str, Any]:
         raw = json.loads(preferences_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {"schema": _SCHEMA, "shapes": {}}
-    if not isinstance(raw, dict) or not isinstance(raw.get("shapes"), dict):
+    if (not isinstance(raw, dict) or raw.get("schema") != _SCHEMA
+            or not isinstance(raw.get("shapes"), dict)):
         return {"schema": _SCHEMA, "shapes": {}}
-    raw.setdefault("schema", _SCHEMA)
     return raw
 
 
@@ -128,22 +128,31 @@ def learned_allow(category: str, tool_name: str, shape: dict[str, Any], min_samp
 
 # --- Pending-approval tracking (pre_tool_call -> post_tool_call handoff) ---------
 
-_pending: dict[str, dict[str, Any]] = {}
+_pending: dict[tuple[str, str, str], dict[str, Any]] = {}
 _PENDING_CAP = 512
 
 
-def remember_pending(tool_call_id: str, category: str, tool_name: str, shape: dict[str, Any]) -> None:
-    """Stash the shape for a call that escalated; consumed by post_tool_call."""
-    if not tool_call_id or category not in _LEARNABLE_CLASSES:
+def remember_pending(
+    call: tuple[str, str, str], category: str, shape: dict[str, Any], args_digest: str,
+) -> None:
+    """Stash an exact foreground-terminal approval candidate until its post hook."""
+    if not all(call) or category not in _LEARNABLE_CLASSES:
         return
     if len(_pending) >= _PENDING_CAP:
         # Drop the oldest half; learning is best-effort.
-        for key in sorted(_pending.keys())[: _PENDING_CAP // 2]:
+        for key in list(_pending)[: _PENDING_CAP // 2]:
             _pending.pop(key, None)
-    _pending[str(tool_call_id)] = {
-        "category": category, "tool_name": tool_name, "shape": shape,
-    }
+    _pending[call] = {"category": category, "shape": shape, "args_digest": args_digest, "approved": False}
 
 
-def consume_pending(tool_call_id: str) -> dict[str, Any] | None:
-    return _pending.pop(str(tool_call_id), None)
+def confirm_pending(call: tuple[str, str, str], pattern_key: str) -> None:
+    """Attach a human response only to the exact plugin rule that was presented."""
+    entry = _pending.get(call)
+    if entry is not None and pattern_key == "plugin_rule:" + scoped_rule_key(
+        entry["category"], "terminal", entry["shape"],
+    ):
+        entry["approved"] = True
+
+
+def consume_pending(call: tuple[str, str, str]) -> dict[str, Any] | None:
+    return _pending.pop(call, None)

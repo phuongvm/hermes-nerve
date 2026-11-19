@@ -296,10 +296,13 @@ Nothing live was modified. The working tree is:
 2. Shape keys hash argv, so whitespace-quoting variants of the same command
    (`git push "origin" main` vs `git push origin main`) produce different
    shapes and re-prompt. Conservative by intent.
-3. Preference learning counts post-success executions; a tool that succeeds
-   without actually doing what was approved would still count (Hermes reports
-   success, not semantics). Learned shapes are now content-complete (B1-B4),
-   so a learned key authorizes exactly the observed operation.
+3. Preference learning requires explicit human consent to the exact plugin rule
+   and host-confirmed foreground terminal completion for the same session, turn,
+   call and arguments. An observer `ok` status alone is not completion. Background
+   calls, cached approvals and hosts without completion evidence add no samples.
+   Version 1 preference samples lack this evidence and are ignored; the next valid
+   sample starts a version 2 store. Exit success does not prove the command's
+   intended effects.
 4. `sudo` inner commands are re-classified but environment-prefix wrappers
    other than the known-safe list fall through to uncertain (conservative).
 5. The 0.82-vs-0.90 auto-allow relies on the deterministic layer's coverage;

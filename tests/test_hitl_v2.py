@@ -27,6 +27,7 @@ from hermes_nerve import gate, risk, preferences  # noqa: E402
 from hermes_nerve.engine import DecisionResult  # noqa: E402
 
 WD = str(REPO)  # pretend the repo is the project workdir
+SESSION, TURN = "hitl-session", "hitl-turn"
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +66,18 @@ def mount(engine):
 def call(command, tool="terminal", tool_call_id="tc-test", **extra_args):
     args = {"command": command, "workdir": WD}
     args.update(extra_args)
-    return gate.pre_tool_call(tool, args, task_id=None, tool_call_id=tool_call_id)
+    return gate.pre_tool_call(tool, args, task_id=None, tool_call_id=tool_call_id,
+                              session_id=SESSION, turn_id=TURN)
+
+
+def consent(call_id, rule_key):
+    gate.post_approval_response(session_id=SESSION, turn_id=TURN, tool_call_id=call_id,
+                                choice="once", pattern_key="plugin_rule:" + rule_key)
+
+
+def post(command, call_id, **outcome):
+    return gate.post_tool_call(tool_call_id=call_id, tool_name="terminal", session_id=SESSION,
+                               turn_id=TURN, args={"command": command, "workdir": WD}, **outcome)
 
 
 def legacy_decision(value, confidence, probabilities):
@@ -141,7 +153,7 @@ def test_unknown_executable_consults_model_then_respects_verdict():
     assert "0.9" not in result["message"].split("Note")[0]
     # scoped key, and pending recorded for preference learning
     assert result["rule_key"].startswith("nerve:hitl:uncertain:terminal:")
-    assert preferences.consume_pending("tc-appr") is not None
+    assert preferences.consume_pending((SESSION, TURN, "tc-appr")) is not None
 
 
 # =====================================================================================
@@ -547,11 +559,13 @@ def test_learned_preference_auto_allows_after_enough_approvals():
     # escalation 1 -> operator approves -> success posts
     r1 = call(shape_cmd, tool_call_id="p1")
     assert r1 is not None
-    assert gate.post_tool_call(tool_call_id="p1", tool_name="terminal", status="ok", result={}) is None
+    consent("p1", r1["rule_key"])
+    assert post(shape_cmd, "p1", status="ok", terminal_foreground_completed=True) is None
     # escalation 2 -> approve -> post
     r2 = call(shape_cmd, tool_call_id="p2")
     assert r2 is not None
-    gate.post_tool_call(tool_call_id="p2", tool_name="terminal", status="ok", result={})
+    consent("p2", r2["rule_key"])
+    post(shape_cmd, "p2", status="ok", terminal_foreground_completed=True)
     # third identical call: learned auto-allow, no interruption
     r3 = call(shape_cmd, tool_call_id="p3")
     assert r3 is None
@@ -567,29 +581,68 @@ def test_denied_calls_never_learn():
     cmd = "./scripts/flaky.sh"
     call(cmd, tool_call_id="d1")
     # operator denies: tool never posts success. Simulate an error post instead:
-    gate.post_tool_call(tool_call_id="d1", tool_name="terminal", error="denied by operator")
+    post(cmd, "d1", status="blocked", error="denied by operator")
     assert call(cmd, tool_call_id="d2") is not None  # still escalates
 
 
 @pytest.mark.parametrize("outcome", [
-    {}, {"status": "blocked"}, {"status": "cancelled"}, {"status": "timeout"},
-    {"status": "error"}, {"status": "ok", "error_type": "tool_error"},
-    {"status": "ok", "error_message": "fixture error"},
+    {}, {"status": "ok"},
+    {"status": "blocked", "terminal_foreground_completed": True},
+    {"status": "cancelled", "terminal_foreground_completed": True},
+    {"status": "timeout", "terminal_foreground_completed": True},
+    {"status": "error", "terminal_foreground_completed": True},
+    {"status": "ok", "terminal_foreground_completed": True, "error_type": "tool_error"},
+    {"status": "ok", "terminal_foreground_completed": True, "error_message": "fixture error"},
 ])
 def test_non_successful_outcomes_consume_pending_without_learning(outcome):
-    tool, call_id = "fixture_tool", "terminal-outcome"
-    shape = {"tool": tool}
-    preferences.remember_pending(call_id, "uncertain", tool, shape)
-    gate.post_tool_call(tool_call_id=call_id, tool_name=tool, result="{}", **outcome)
-    assert preferences.consume_pending(call_id) is None
-    assert preferences.approval_count("uncertain", tool, shape) == 0
+    cmd, call_id = "./scripts/fixture.sh", "terminal-outcome"
+    args = {"command": cmd, "workdir": WD}
+    shape = risk.assess_tool_call("terminal", args).shape
+    key = (SESSION, TURN, call_id)
+    preferences.remember_pending(key, "uncertain", shape, gate.canonical_hash(args))
+    consent(call_id, preferences.scoped_rule_key("uncertain", "terminal", shape))
+    post(cmd, call_id, result="{}", **outcome)
+    assert preferences.consume_pending(key) is None
+    assert preferences.approval_count("uncertain", "terminal", shape) == 0
+
+
+def test_completion_does_not_learn_for_another_call_or_arguments():
+    args = {"command": "./scripts/fixture.sh", "workdir": WD}
+    shape = risk.assess_tool_call("terminal", args).shape
+    key = (SESSION, TURN, "fixture")
+    preferences.remember_pending(key, "uncertain", shape, gate.canonical_hash(args))
+    consent(key[2], preferences.scoped_rule_key("uncertain", "terminal", shape))
+    fields = dict(tool_call_id=key[2], tool_name="terminal", session_id=SESSION,
+                  turn_id=TURN, args=args, status="ok", terminal_foreground_completed=True)
+    gate.post_tool_call(**{**fields, "session_id": "other-session"})
+    gate.post_tool_call(**{**fields, "turn_id": "other-turn"})
+    assert preferences.approval_count("uncertain", "terminal", shape) == 0
+    assert preferences.consume_pending(key) is not None
+    preferences.remember_pending(key, "uncertain", shape, gate.canonical_hash(args))
+    consent(key[2], preferences.scoped_rule_key("uncertain", "terminal", shape))
+    gate.post_tool_call(**{**fields, "args": {**args, "workdir": "elsewhere"}})
+    assert preferences.consume_pending(key) is None
+    assert preferences.approval_count("uncertain", "terminal", shape) == 0
+
+
+def test_legacy_preference_samples_are_not_trusted():
+    tool, shape = "terminal", {"tool": "terminal"}
+    path = preferences.preferences_path()
+    legacy = {"schema": "hermes-nerve-preferences/v1", "shapes": {
+        preferences.shape_fingerprint(shape): {"category": "uncertain", "tool_name": tool, "count": 10},
+    }}
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert not preferences.learned_allow("uncertain", tool, shape, 2)
+    assert json.loads(path.read_text(encoding="utf-8")) == legacy
+    preferences.record_approval("uncertain", tool, shape)
+    assert preferences.approval_count("uncertain", tool, shape) == 1
 
 
 def test_consequential_class_is_never_learned():
     r1 = call("git push origin feature-x", tool_call_id="c1")
-    gate.post_tool_call(tool_call_id="c1", tool_name="terminal", status="ok", result={})
+    post("git push origin feature-x", "c1", status="ok", terminal_foreground_completed=True)
     r2 = call("git push origin feature-x", tool_call_id="c2")
-    gate.post_tool_call(tool_call_id="c2", tool_name="terminal", status="ok", result={})
+    post("git push origin feature-x", "c2", status="ok", terminal_foreground_completed=True)
     r3 = call("git push origin feature-x", tool_call_id="c3")
     assert r3 is not None, "publication approvals must NEVER be bypassed by learning"
 

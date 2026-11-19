@@ -762,8 +762,7 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, **kwar
         )
         if evidence:
             message += f"\nScan context: {evidence}"
-        prefs.remember_pending(str(correlation.get("tool_call_id") or ""),
-                               assessment.category, tool_name, assessment.shape)
+        _remember_terminal_approval(correlation, tool_name, args, assessment)
         _record_gate_event(tool_name=tool_name, action="escalated",
                            reason=("model:weak-allow p(ALLOW)=%s confidence=%s"
                                    % (f"{p_allow:.3f}" if p_allow is not None else "n/a",
@@ -781,8 +780,7 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, **kwar
         message = format_approval_message(assessment, model_note=_UNCERTAINTY_MODEL_NOTE)
         if evidence:
             message += f"\nScan context: {evidence}"
-        prefs.remember_pending(str(correlation.get("tool_call_id") or ""), assessment.category,
-                               tool_name, assessment.shape)
+        _remember_terminal_approval(correlation, tool_name, args, assessment)
         _record_gate_event(tool_name=tool_name, action="escalated",
                            reason="model:approval", provider_call=False,
                            value="APPROVAL", confidence=result.confidence,
@@ -832,33 +830,42 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, **kwar
     return None
 
 
-def post_tool_call(**kwargs):
-    """Preference learning: count operator-approved executions of a shape.
+def _approval_call(fields) -> tuple[str, str, str]:
+    return (str(fields.get("session_id") or ""), str(fields.get("turn_id") or ""),
+            str(fields.get("tool_call_id") or ""))
 
-    A pending entry exists only for uncertain-band calls this gate escalated.
-    If the call afterwards completed successfully, a human approved it (there
-    is no other path past our escalation), and the exact shape gains one
-    learned sample. Denials and errors never count. Generic Hermes approvals
-    of unrelated keys never reach this path because pending is keyed by
-    tool_call_id.
-    """
-    tool_call_id = str(kwargs.get("tool_call_id") or "")
-    if not tool_call_id:
+
+def _remember_terminal_approval(correlation, tool_name, args, assessment) -> None:
+    if tool_name == "terminal" and learned_preferences_enabled():
+        prefs.remember_pending(_approval_call(correlation), assessment.category,
+                               assessment.shape, canonical_hash(args))
+
+
+def post_approval_response(**kwargs: Any) -> None:
+    """Observe explicit human consent; never treat a suggestion as approval."""
+    choice, key = kwargs.get("choice"), kwargs.get("pattern_key")
+    if choice in ("once", "session", "always") and isinstance(key, str):
+        prefs.confirm_pending(_approval_call(kwargs), key)
+
+
+def post_tool_call(**kwargs):
+    """Learn only from host-confirmed foreground completions of an approved terminal call."""
+    if kwargs.get("tool_name") != "terminal":
         return None
-    entry = prefs.consume_pending(tool_call_id)
-    if entry is None:
+    entry = prefs.consume_pending(_approval_call(kwargs))
+    if entry is None or not entry["approved"]:
         return None
     # Approval is not a successful execution: another guard may still refuse dispatch.
-    if kwargs.get("status") != "ok" or any(
-        kwargs.get(field) for field in ("error", "exception", "error_type", "error_message")
-    ):
+    if (kwargs.get("terminal_foreground_completed") is not True or kwargs.get("status") != "ok"
+            or any(kwargs.get(field) for field in ("error", "exception", "error_type", "error_message"))):
+        return None
+    args = kwargs.get("args")
+    if not isinstance(args, dict) or canonical_hash(args) != entry["args_digest"]:
         return None
     result = kwargs.get("result")
     if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
         return None
-    prefs.record_approval(entry.get("category", "uncertain"),
-                          entry.get("tool_name", str(kwargs.get("tool_name") or "")),
-                          entry.get("shape") or {})
+    prefs.record_approval(entry["category"], "terminal", entry["shape"])
     return None
 
 

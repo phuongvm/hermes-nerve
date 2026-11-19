@@ -23,7 +23,7 @@ provides_tools:
   - nerve_remote_worker_result
   - nerve_remote_worker_cancel
   - nerve_remote_worker_control
-provides_hooks: [pre_tool_call, post_tool_call, pre_llm_call, transform_tool_result, pre_verify, post_api_request, api_request_error, post_llm_call, on_session_end]
+provides_hooks: [pre_tool_call, post_tool_call, post_approval_response, pre_llm_call, transform_tool_result, pre_verify, post_api_request, api_request_error, post_llm_call, on_session_end]
 requires_env: []
 config_schema:
   nerve_profile: {type: str, default: "", description: "Optional Nerve personality: fat_cat, operator, lean, marie_kondo, or custom. Empty preserves v0.2.3 legacy behavior."}

@@ -385,6 +385,7 @@ def _register_legacy(ctx, policy):
         ctx.register_hook("post_tool_call", ledger.observe_tool_call)
         ctx.register_hook("post_tool_call", nervous.post_tool_call)
         ctx.register_hook("post_tool_call", gate.post_tool_call)
+        ctx.register_hook("post_approval_response", gate.post_approval_response)
     ctx.register_hook("pre_llm_call", _pre_llm)
     ctx.register_hook("transform_tool_result", _transform_tool_result)
     if headless_worker:
@@ -711,7 +712,9 @@ def _register_profile(ctx):
     if policy.enabled("work_supervision"):ctx.register_hook("post_tool_call",work_hooks.post_tool_call)
     if not headless_worker and policy.enabled("context_governor"):ctx.register_hook("post_tool_call",ledger.observe_tool_call)
     if not headless_worker and policy.enabled("nervous"):ctx.register_hook("post_tool_call",nervous.post_tool_call)
-    if not headless_worker and policy.enabled("action_gate"):ctx.register_hook("post_tool_call",gate.post_tool_call)
+    if not headless_worker and policy.enabled("action_gate"):
+        ctx.register_hook("post_tool_call", gate.post_tool_call)
+        ctx.register_hook("post_approval_response", gate.post_approval_response)
     if policy.enabled("work_supervision") or (not headless_worker and (policy.enabled("nervous") or policy.enabled("assistant_loops"))):
         ctx.register_hook("pre_llm_call",_pre_llm)
     # Use Hermes' supported behavior-changing request middleware. Observer
