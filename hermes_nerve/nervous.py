@@ -1250,7 +1250,8 @@ class NervousSystem:
         tool_name = str(kwargs.get("tool_name") or "")
         if tool_name.startswith(("nerve_", "jev_")):
             return None
-        args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+        raw_args = kwargs.get("args")
+        args = raw_args if isinstance(raw_args, dict) else {}
         state = self._resolve_turn(turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""))
         if state is None:
             return None
@@ -1284,6 +1285,21 @@ class NervousSystem:
                 ),
             }
         proposed_fp = tool_action_fingerprint(tool_name, args)
+        with self._lock:
+            progress = state.active_control
+            eligible = (
+                progress is not None and progress.source == "local-progress-stall"
+                and progress.control in BLOCKING_CONTROLS and not state.finished
+                and state.task_intent_disposition == "trusted" and state.session_id == kwargs.get("session_id")
+                and tool_kind(tool_name, args) != "mutation"
+            )
+        if eligible:
+            reservation = self._reserve_progress_read(state, tool_name, args, kwargs.get("tool_call_id"))
+            if reservation == "error":
+                return {"action": "block", "message": "Nerve prerequisite bookkeeping unavailable; no read dispatched."}
+            with self._lock:
+                if reservation == "reserved" and not state.finished and state.active_control is progress:
+                    return None  # Decline only our progress veto; other callbacks still run.
         with self._lock:
             directive = state.active_control
             if directive is None:
@@ -1380,6 +1396,19 @@ class NervousSystem:
             )
             state.active_control = None
         return None
+
+    @staticmethod
+    def _reserve_progress_read(state: TurnState, tool: str, args: dict, call_id: Any) -> str:
+        if not isinstance(call_id, str) or not call_id:
+            return "unavailable"
+        try:
+            from agent.prerequisite.guard import reserve_progress_read
+        except ImportError:
+            return "unavailable"  # Older host: retain the progress veto.
+        try:
+            return reserve_progress_read(state.session_id, state.assignment_id, call_id, tool, args)
+        except Exception:
+            return "error"  # The composite treats uncaught nervous exceptions as advisory.
 
     def _do_assessment(self, payload: dict[str, Any]) -> None:
         tid = str(payload.get("turn_id") or "")
