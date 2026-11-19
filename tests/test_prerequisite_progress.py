@@ -1,5 +1,8 @@
-"""Task 3.1: policy bounds only; no reservations or guard changes."""
+"""Prerequisite limits and reservation accounting, without content dispatch."""
 import json
+import os
+import runpy
+from pathlib import Path
 
 import pytest
 
@@ -103,3 +106,71 @@ def test_registration_resolves_prerequisite_ceilings(tmp_path, monkeypatch, prof
         assert any(row.get("kind") == "prerequisite_config_invalid"
                    and row.get("setting") == "prerequisite_max_seconds"
                    for row in map(json.loads, data.splitlines()))
+
+
+@pytest.mark.parametrize("case", ["valid", "invalid", "no-catalog", "read-only", "output"])
+def test_native_hook_starts_preparation_once(tmp_path, monkeypatch, case):
+    from hermes_nerve import nervous
+
+    source = os.environ.get("HERMES_TASK_INTENT_HOST")
+    if not source:
+        pytest.skip("Set HERMES_TASK_INTENT_HOST to the matching Hermes worktree")
+    host = Path(source).resolve()
+    monkeypatch.syspath_prepend(str(host))
+    from agent import delegation_context as dc
+    from agent.prerequisite import catalog, reservations
+
+    assert Path(dc.__file__).resolve().is_relative_to(host)
+    assert Path(reservations.__file__).resolve().is_relative_to(host)
+    fixture = runpy.run_path(str(host / "tests/tools/proposal_catalog_fixture.py"))
+    planning = tmp_path / "planning"
+    config = fixture["proposal_entry"](planning)
+    selection = None if case == "no-catalog" else catalog.freeze_proposal_catalog(fixture["CHANGE"], config)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *a, **kw: selection)
+    now = [5.0]
+    monkeypatch.setattr(reservations, "_monotonic", lambda: now[0])
+    for key, name in (("HERMES_NERVE_NERVOUS_EVENTS", "events.jsonl"),
+                      ("HERMES_NERVE_OUTCOMES", "outcomes.jsonl"),
+                      ("HERMES_NERVE_POLICY_MEMORY", "policy.jsonl")):
+        monkeypatch.setenv(key, str(tmp_path / name))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider_attempts = []
+
+    def forbidden_provider():
+        provider_attempts.append(True)
+        raise AssertionError("No inference in prerequisite accounting tests")
+
+    system = NervousSystem(engine_factory=forbidden_provider)
+    monkeypatch.setattr(nervous, "_default", system)
+    system.configure(enabled=True, admission_enabled=False, call_threshold=1.0,
+                     local_learning=False, policy_memory_enabled=False,
+                     prerequisite_max_operations=1, prerequisite_max_seconds=0 if case == "invalid" else 10)
+    goal = "Summarize the report." if case == "read-only" else "Write proposal.md."
+    scope = dict(actor_session_id="actor", parent_session_id="parent", goal=goal, context=None)
+    args = {"path": str(planning / "rules/AGENTS.md")}
+    try:
+        with dc.native_task_intent(**scope) as intent:
+            hook = dict(user_message=goal, session_id="actor", parent_session_id="parent", task_intent=intent)
+            nervous.pre_llm_call(**hook, turn_id="initial")
+            decision = reservations.reserve_read(intent, "actor", "page-1", "read_file", args)
+            assert decision == ("reserved" if case in {"valid", "output"} else "unavailable")
+            if case == "output":
+                reservations.note_output_dispatch("actor", "parent", "write_file", {"path": "scratch.md"})
+                assert reservations.reserve_read(intent, "actor", "page-2", "read_file", args) == "exhausted"
+                reservations.note_output_dispatch("actor", "parent", "write_file", {"path": "proposal.md"})
+                assert reservations.begin_read(intent, "actor", "page-1", "read_file", args) == "output"
+            assert system.status(turn_id="initial")["tool_actions"] == 0
+            system.observe_tool_call(turn_id="initial", tool_name="read_file", args=args,
+                                     tool_call_id="ordinary", status="ok", result="fixture")
+            system.finish_turn(turn_id="initial")
+            handoff = dc._ResumeIntent(intent)
+        system.configure(prerequisite_max_operations=128, prerequisite_max_seconds=900)
+        with dc.native_task_intent(**scope, resumed=True, handoff=handoff) as resumed:
+            assert resumed is intent
+            nervous.pre_llm_call(**hook, turn_id="continued")
+            assert system.status(turn_id="continued")["tool_actions"] == 1
+            decision = reservations.reserve_read(intent, "actor", "page-2", "read_file", args)
+            assert decision == {"valid": "exhausted", "output": "output"}.get(case, "unavailable")
+    finally:
+        system.configure(enabled=False)
+    assert not provider_attempts

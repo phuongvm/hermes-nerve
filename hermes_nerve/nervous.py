@@ -525,7 +525,9 @@ class NervousSystem:
                 task_intent_disposition=disposition, assignment_id=assignment_id,
                 required_outputs=progress_requested_paths(intent_message, produced_only=True) if disposition == "trusted" else (),
             )
+            first_assignment_turn = False
             if disposition == "trusted":
+                first_assignment_turn = task_intent not in self._assignment_progress
                 state.progress = self._assignment_progress.setdefault(task_intent, state.progress)
                 if (state.change_required and state.progress.tool_actions >= _PROGRESS_CHALLENGE_AFTER
                         and not state.progress.relevant_mutation_attempts):
@@ -534,6 +536,8 @@ class NervousSystem:
             if session_id:
                 self._session_turn[str(session_id)] = tid
             self._metrics["turns_started"] += 1
+        if first_assignment_turn and state.change_required:
+            self._initialize_preparation(task_intent, session_id, state.requested_paths)
         self._log("turn_start", {"turn_id": tid, "session_id": session_id, "prompt_sha256": state.user_message_hash})
         if self._config.admission_enabled and _is_trivial_ack(user_message):
             # Skip the admission provider call, but stay armed at WATCH rather than OFF: a bare
@@ -555,6 +559,26 @@ class NervousSystem:
                 state.admission = "ON"
                 self._metrics["admission_on"] += 1
         return tid
+
+    def _initialize_preparation(
+        self, task_intent: Any, session_id: str, requested_paths: tuple[str, ...],
+    ) -> None:
+        selection = getattr(task_intent, "proposal_selection", None)
+        if selection is None:
+            return
+        try:
+            from agent.prerequisite.reservations import start_preparation
+        except ImportError:
+            return  # Older hosts retain ordinary progress control.
+        try:
+            limits = self.prerequisite_limits(selection.operations, selection.seconds)
+            if limits is not None:
+                start_preparation(
+                    task_intent, session_id, *limits,
+                    output_matches=lambda tool, args: mutation_is_relevant(tool, args, requested_paths),
+                )
+        except Exception:
+            self._log("prerequisite_initialization_failed", {"assignment_id": task_intent.assignment_id})
 
     def _do_admission(self, payload: dict[str, Any]) -> None:
         tid = str(payload.get("turn_id") or "")
