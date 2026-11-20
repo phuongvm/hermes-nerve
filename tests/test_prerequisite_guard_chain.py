@@ -832,3 +832,137 @@ def test_progress_stall_remains_active_across_repeated_progress_guard_blocks(cha
     chain.args = {"workdir": chain.args["workdir"], "change": "different-change-slug"}
     assert "progress guard" in dispatch(chain, "still-stalled-2").lower()
     assert chain.system.status(turn_id="turn")["active_control"]["source"] == "local-progress-stall"
+
+
+@pytest.mark.parametrize(
+    "old_nerve_rev",
+    [
+        "69307ca83763b8acac441cf20e31e965793fe4c9",  # Task 3.2 Nerve baseline
+        "323431b824c225eefd3d013f1d718d60e7b5b08e",  # Pre-change Nerve main baseline
+    ],
+)
+def test_cross_version_new_host_with_old_nerve_baseline(tmp_path, monkeypatch, old_nerve_rev):
+    """New Hermes host + old Nerve baseline preserves conservative progress-stall guard without crashing."""
+    import importlib.util
+    import io
+    import subprocess
+    import sys
+    import tarfile
+
+    source = os.environ.get("HERMES_TASK_INTENT_HOST")
+    if not source:
+        pytest.skip("Set HERMES_TASK_INTENT_HOST to the paired Hermes worktree")
+    host = Path(source).resolve()
+    monkeypatch.syspath_prepend(str(host))
+    from agent import delegation_context as dc, tool_executor as executor
+    from agent.prerequisite import catalog
+    from hermes_cli import lifecycle, plugins
+
+    repo_root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "archive", "--format=tar", old_nerve_rev],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    old_dir = tmp_path / f"nerve-{old_nerve_rev[:7]}"
+    old_dir.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:") as tar:
+        tar.extractall(old_dir, filter="data")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_NERVE_NERVOUS_EVENTS", str(tmp_path / "nervous.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_OUTCOMES", str(tmp_path / "outcomes.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_POLICY_MEMORY", str(tmp_path / "policy.jsonl"))
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_TASK_ID", "HERMES_NERVE_REMOTE_CONTROL_FILE"):
+        monkeypatch.delenv(key, raising=False)
+
+    pkg_name = f"old_nerve_guard_{old_nerve_rev[:7]}"
+    spec = importlib.util.spec_from_file_location(
+        pkg_name, old_dir / "__init__.py", submodule_search_locations=[str(old_dir)]
+    )
+    assert spec is not None and spec.loader is not None
+    old_plugin = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, pkg_name, old_plugin)
+    spec.loader.exec_module(old_plugin)
+
+    old_system = old_plugin.nervous.NervousSystem(
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("No provider calls"))
+    )
+    monkeypatch.setattr(old_plugin.nervous, "_default", old_system)
+    monkeypatch.setattr(old_plugin.gate, "pre_tool_call", lambda **_kw: None)
+    monkeypatch.setattr(old_plugin.work_hooks, "pre_tool_call", lambda **_kw: None)
+
+    ctx = Ctx(
+        tmp_path,
+        {
+            "nervous_turn_admission": False,
+            "nervous_local_learning": False,
+            "nervous_policy_memory_enabled": False,
+            "nervous_call_threshold": 1.0,
+        },
+    )
+    host_ctx = plugins.PluginContext(plugins.PluginManifest(name="nerve"), plugins.PluginManager(str(tmp_path)))
+    monkeypatch.setattr(ctx, "reserve_prerequisite_read", host_ctx.reserve_prerequisite_read, raising=False)
+    monkeypatch.setattr(ctx, "register_pre_verify_no_edits", host_ctx.register_pre_verify_no_edits, raising=False)
+    old_plugin.register(ctx)
+
+    manager = plugins.PluginManager(str(tmp_path))
+    manager._hooks["pre_tool_call"] = [cb for ev, cb in ctx.hooks if ev == "pre_tool_call"]
+    manager._hooks["post_tool_call"] = [cb for ev, cb in ctx.hooks if ev == "post_tool_call"]
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+    monkeypatch.setattr(lifecycle, "_observe", lambda *_a, **_kw: None)
+
+    fixture = runpy.run_path(str(host / "tests/tools/proposal_catalog_fixture.py"))
+    planning = tmp_path / "planning"
+    selection = catalog.freeze_proposal_catalog(fixture["CHANGE"], fixture["proposal_entry"](planning))
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: selection)
+
+    try:
+        goal_msg = "Update src/app.py and write proposal.md."
+        with dc.native_task_intent(
+            actor_session_id="actor", parent_session_id="parent", goal=goal_msg, context=None
+        ) as intent:
+            for cb in [cb for ev, cb in ctx.hooks if ev == "pre_llm_call"]:
+                cb(
+                    user_message=goal_msg,
+                    session_id="actor",
+                    parent_session_id="parent",
+                    turn_id="turn-old",
+                    task_intent=intent,
+                )
+            for idx in range(12):
+                old_system.observe_tool_call(
+                    tool_name="read_file",
+                    args={"path": f"n-{idx}.md"},
+                    status="ok",
+                    result="ok",
+                    turn_id="turn-old",
+                    session_id="actor",
+                    tool_call_id=f"o-{idx}",
+                )
+            agent = SimpleNamespace(
+                session_id="actor",
+                _parent_session_id="parent",
+                _current_turn_id="turn-old",
+                _tool_guardrails=SimpleNamespace(before_call=lambda *_: SimpleNamespace(allows_execution=True)),
+            )
+            args = {"workdir": str(planning), "change": fixture["CHANGE"]}
+            state = executor._ManagedToolResult(None, args, [], False, False)
+            ref = executor._ToolCallRef("openspec_status", args, "task-old", "cand-old", [])
+            raw = executor._dispatch_authorized_once(
+                agent,
+                state,
+                ref,
+                execute=lambda _a: pytest.fail("Old plugin must still block at progress stall"),
+                scope_block=None,
+                display_index=None,
+                begin_execution=None,
+                authorization_gate=None,
+            )
+            assert state.blocked
+            assert "progress guard" in json.loads(raw)["error"].lower()
+    finally:
+        old_system.configure(enabled=False)
+        for mod_key in [k for k in sys.modules if k == pkg_name or k.startswith(f"{pkg_name}.")]:
+            sys.modules.pop(mod_key, None)

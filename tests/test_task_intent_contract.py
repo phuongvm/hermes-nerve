@@ -123,14 +123,9 @@ def host_intent(monkeypatch):
     if not host:
         pytest.skip("Set HERMES_TASK_INTENT_HOST to the compatible Hermes worktree")
     assert host is not None
-    import importlib.util
-    import sys
-    source = Path(host).resolve() / "agent" / "delegation_context.py"
-    spec = importlib.util.spec_from_file_location("agent.delegation_context", source)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    source = (Path(host).resolve() / "agent" / "delegation_context.py").resolve()
+    monkeypatch.syspath_prepend(str(Path(host).resolve()))
+    from agent import delegation_context as module
     assert Path(module.__file__).resolve() == source
     return module
 

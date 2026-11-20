@@ -1309,6 +1309,7 @@ class NervousSystem:
                 receipt = None
                 with self._lock:
                     if raw_call_id_early in state.progress.progress_blocked_calls:
+                        state.progress.progress_blocked_calls.remove(raw_call_id_early)
                         self_progress_block = True
                         state.progress.tool_actions += 1
                         receipt = self._try_build_receipt_locked(

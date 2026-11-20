@@ -8,12 +8,16 @@ gate events to the LIVE ledger at ~/.hermes/nerve/gate-events.jsonl.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
+_HOST_ENV = os.environ.get("HERMES_TASK_INTENT_HOST")
+if _HOST_ENV and Path(_HOST_ENV).is_dir():
+    sys.path.insert(0, str(Path(_HOST_ENV).resolve()))
 sys.path.insert(0, str(REPO))
 
 

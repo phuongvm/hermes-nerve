@@ -42,7 +42,7 @@ class RegistrationTests(unittest.TestCase):
             self.assertEqual(VERSION,"0.4.15")
             self.assertEqual(set(ctx.tools),EXPECTED_TOOLS)
             self.assertNotIn("nerve_assistant",ctx.tools)
-            self.assertEqual({n for n,_ in ctx.hooks},EXPECTED_HOOKS)
+            self.assertEqual({n for n,_ in ctx.hooks},EXPECTED_HOOKS|{"post_approval_response"})
             self.assertIsNotNone(ctx.engine)
             self.assertIs(work_config.call_args.kwargs["nerve_auto_kill"],True)
 
