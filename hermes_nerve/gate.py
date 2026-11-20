@@ -606,8 +606,10 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, **kwar
         return None
 
     # ---- Layer 1.5: learned preference (uncertain band only) -------------------
-    if learned_preferences_enabled() and prefs.learned_allow(
-            assessment.category, tool_name, assessment.shape, preference_min_samples()):
+    if (learned_preferences_enabled()
+            and prefs.has_valid_scope(tool_name, assessment.shape)
+            and prefs.learned_allow(
+                assessment.category, tool_name, assessment.shape, preference_min_samples())):
         _record_gate_event(tool_name=tool_name, action="auto-allow",
                            reason="learned-preference", provider_call=False,
                            risk_category=assessment.category, detail=assessment.display,
@@ -836,7 +838,8 @@ def _approval_call(fields) -> tuple[str, str, str]:
 
 
 def _remember_terminal_approval(correlation, tool_name, args, assessment) -> None:
-    if tool_name == "terminal" and learned_preferences_enabled():
+    if (tool_name == "terminal" and learned_preferences_enabled()
+            and prefs.has_valid_scope(tool_name, assessment.shape)):
         prefs.remember_pending(_approval_call(correlation), assessment.category,
                                assessment.shape, canonical_hash(args))
 
@@ -853,7 +856,7 @@ def post_tool_call(**kwargs):
     if kwargs.get("tool_name") != "terminal":
         return None
     entry = prefs.consume_pending(_approval_call(kwargs))
-    if entry is None or not entry["approved"]:
+    if entry is None or not entry["approved"] or not prefs.has_valid_scope("terminal", entry.get("shape")):
         return None
     # Approval is not a successful execution: another guard may still refuse dispatch.
     if (kwargs.get("terminal_foreground_completed") is not True or kwargs.get("status") != "ok"

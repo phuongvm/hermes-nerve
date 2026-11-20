@@ -380,3 +380,110 @@ def test_approval_learning_requires_completed_execution(chain, monkeypatch, tmp_
     assert ("fixture separate rule" in approvals[0]) == (case == "other-rule")
     assert gate.prefs.consume_pending(("actor", "turn", ref.call_id)) is None
     assert gate.prefs.approval_count(*shape) == (1 if case == "completed" else 0)
+
+
+@pytest.mark.parametrize("chain", ["real-gate"], indirect=True)
+def test_classifier_scope_error_neither_records_nor_reuses_preference(chain, monkeypatch, tmp_path):
+    from model_tools import _approval_observability, _CallIds
+    from tools import approval, approval_context, approval_prompt, terminal_tool_result
+
+    gate = chain.gate
+    executor = chain.executor
+    gate.configure(mode="enforce", scope="all", risk_preflight=True,
+                   learned_preferences=True, preference_min_samples=1)
+    monkeypatch.setattr(gate, "evaluate_tool_call", lambda **_: SimpleNamespace(
+        value="APPROVAL", confidence=0.9, latency_ms=1.0, probabilities={"APPROVAL": 0.9},
+    ))
+
+    prompts = []
+
+    def answer(_command, reason, **_kwargs):
+        prompts.append(reason)
+        return "session"
+
+    monkeypatch.setattr(approval, "_presence", lambda *_: (None, True, False, False))
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_context, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "prompt_dangerous_approval", answer)
+    monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", answer)
+    monkeypatch.setattr(approval, "_session_approved", {})
+    monkeypatch.setattr(approval, "_permanent_approved", set())
+    monkeypatch.setattr(approval, "_permanent_approved_by_home", {})
+
+    chain.system.configure(enabled=False)
+    chain.agent.tool_progress_callback = None
+    monkeypatch.setattr(executor, "_begin_tool_execution", lambda *_: None)
+    monkeypatch.setattr(executor, "_run_with_activity_heartbeat", lambda _agent, _tool, run: run())
+
+    # Pre-seed an empty-scope v2 entry to verify lookup-side rejection in the live chain.
+    pref_path = gate.prefs.preferences_path()
+    empty_fp = gate.prefs.shape_fingerprint({})
+    pref_path.write_text(json.dumps({
+        "schema": "hermes-nerve-preferences/v2",
+        "shapes": {empty_fp: {"category": "uncertain", "tool_name": "terminal", "count": 5}},
+    }), encoding="utf-8")
+
+    def dispatch_terminal(command: str, call_id: str) -> None:
+        call_args = {"command": command, "workdir": str(tmp_path)}
+        ref = executor._ToolCallRef("terminal", call_args, "fixture-task", call_id, [])
+
+        def handler(_final_args):
+            with _approval_observability(_CallIds(ref.task_id, "actor", ref.call_id, "turn")):
+                return terminal_tool_result.finalize_foreground_result(
+                    command=call_args["command"], result={"returncode": 0, "output": "fixture"},
+                    env=SimpleNamespace(), env_type="local", effective_task_id=ref.task_id,
+                    task_id=ref.task_id, session_id="actor", session_key="actor", workdir=call_args["workdir"],
+                    command_cwd=call_args["workdir"], approval_note=None,
+                )
+
+        def run(_agent, **kwargs):
+            state = executor._ManagedToolResult(None, call_args, [], False, True)
+            state.result = executor._dispatch_authorized_once(
+                chain.agent, state, ref, execute=kwargs["execute"], scope_block=None,
+                display_index=None, begin_execution=None, authorization_gate=None,
+            )
+            return state
+
+        monkeypatch.setattr(executor, "_run_sequential_tool_execution_middleware", run)
+        monkeypatch.setattr(executor, "_commit_tool_result", lambda *_a, **_kw: None)
+        plan = executor._SequentialDispatch(
+            execute=handler, error_result=lambda exc: f"Error executing tool 'terminal': {exc}",
+            error_log="Fixture tool %s raised: %s", finish_spinner=False,
+        )
+        messages = []
+        state, duration = executor._run_sequential_call(
+            chain.agent, plan, ref, scope_block=None, messages=messages, remaining_calls=[],
+            display_index=1, tool_start_time=executor.time.time(),
+        )
+        assert not state.blocked
+        executor._publish_sequential_result(
+            chain.agent, messages, ref, state, tool_duration=duration, index=0, budget=None, transform_applied=True,
+        )
+
+    real_assess = gate.risk.assess_tool_call
+
+    def failing_assess(*_a, **_kw):
+        raise RuntimeError("classifier failure")
+
+    monkeypatch.setattr(gate.risk, "assess_tool_call", failing_assess)
+    dispatch_terminal("./scripts/unclassified-one.sh", "err-1")
+    assert len(prompts) == 1
+    assert gate.prefs.approval_count("uncertain", "terminal", {}) == 0
+    assert json.loads(pref_path.read_text(encoding="utf-8"))["shapes"][empty_fp]["count"] == 5
+
+    # Second call with classifier error must NOT be auto-allowed by Nerve preferences or session rule cache.
+    dispatch_terminal("./scripts/unclassified-two.sh", "err-2")
+    assert len(prompts) == 2
+    assert gate.prefs.approval_count("uncertain", "terminal", {}) == 0
+
+    # Positive control: valid nonempty classifier scope learns after completion and auto-allows next call.
+    monkeypatch.setattr(gate.risk, "assess_tool_call", real_assess)
+    monkeypatch.setattr(approval, "_session_approved", {})
+    valid_args = {"command": "./scripts/valid-chain-control.sh", "workdir": str(tmp_path)}
+    valid_shape = real_assess("terminal", valid_args).shape
+    dispatch_terminal(valid_args["command"], "valid-1")
+    assert len(prompts) == 3
+    assert gate.prefs.approval_count("uncertain", "terminal", valid_shape) == 1
+    dispatch_terminal(valid_args["command"], "valid-2")
+    assert len(prompts) == 3
+    assert gate.prefs.learned_allow("uncertain", "terminal", valid_shape, 1) is True

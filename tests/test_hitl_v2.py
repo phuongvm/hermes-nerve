@@ -626,7 +626,8 @@ def test_completion_does_not_learn_for_another_call_or_arguments():
 
 
 def test_legacy_preference_samples_are_not_trusted():
-    tool, shape = "terminal", {"tool": "terminal"}
+    tool = "terminal"
+    shape = risk.assess_tool_call(tool, {"command": "./scripts/fixture.sh", "workdir": WD}).shape
     path = preferences.preferences_path()
     legacy = {"schema": "hermes-nerve-preferences/v1", "shapes": {
         preferences.shape_fingerprint(shape): {"category": "uncertain", "tool_name": tool, "count": 10},
@@ -636,6 +637,127 @@ def test_legacy_preference_samples_are_not_trusted():
     assert json.loads(path.read_text(encoding="utf-8")) == legacy
     preferences.record_approval("uncertain", tool, shape)
     assert preferences.approval_count("uncertain", tool, shape) == 1
+
+
+_INVALID_PREFERENCE_SCOPES = [
+    {},
+    {"tool": "terminal"},
+    {"tool": "terminal", "argv": [], "workdir": WD, "category": "uncertain"},
+    {"tool": "terminal", "argv": ["./scripts/fixture.sh"], "workdir": "", "category": "uncertain"},
+    {"tool": "terminal", "argv": ["./scripts/fixture.sh"], "workdir": "/nonexistent-nerve-scope", "category": "uncertain"},
+    {"kind": "pipeline", "segments": [
+        {"tool": "terminal", "argv": [], "workdir": WD, "category": "uncertain"},
+        {"tool": "terminal", "argv": ["head", "-5"], "workdir": WD, "category": "safe_routine"},
+    ]},
+]
+
+
+@pytest.mark.parametrize("invalid_shape", _INVALID_PREFERENCE_SCOPES)
+def test_learned_preference_rejects_invalid_scope_on_record(monkeypatch, invalid_shape):
+    eng = FakeEngine(value="APPROVAL", confidence=0.9,
+                     probabilities={"ALLOW": 0.05, "APPROVAL": 0.90, "BLOCK": 0.05})
+    mount(eng)
+    gate.configure(mode="enforce", min_confidence=0.80, min_allow_probability=0.90,
+                   scope="selective", risk_preflight=True,
+                   learned_preferences=True, preference_min_samples=1)
+    cmd = "./scripts/fixture.sh"
+    args = {"command": cmd, "workdir": WD}
+
+    # Positive control first: valid nonempty classifier scope records and auto-allows identically.
+    valid_cmd = "./scripts/valid-positive-control.sh --verify"
+    valid_shape = risk.assess_tool_call("terminal", {"command": valid_cmd, "workdir": WD}).shape
+    rc1 = call(valid_cmd, tool_call_id="pos-rec-1")
+    assert rc1 is not None and rc1["action"] == "approve"
+    consent("pos-rec-1", rc1["rule_key"])
+    post(valid_cmd, "pos-rec-1", status="ok", terminal_foreground_completed=True)
+    assert preferences.approval_count("uncertain", "terminal", valid_shape) == 1
+    assert call(valid_cmd, tool_call_id="pos-rec-2") is None
+
+    # Record side: neither direct helpers nor classifier error/incomplete scope may record a sample.
+    key = (SESSION, TURN, "invalid-direct")
+    preferences.remember_pending(key, "uncertain", invalid_shape, gate.canonical_hash(args))
+    consent("invalid-direct", preferences.scoped_rule_key("uncertain", "terminal", invalid_shape))
+    post(cmd, "invalid-direct", status="ok", terminal_foreground_completed=True)
+    preferences.record_approval("uncertain", "terminal", invalid_shape)
+    assert preferences.consume_pending(key) is None
+
+    def broken_classifier(tool_name, call_args, workdir=None):
+        if invalid_shape == {}:
+            raise RuntimeError("classifier failure")
+        return risk.RiskAssessment(
+            risk.UNCERTAIN, tool_name,
+            action_label="Incomplete scope fixture",
+            summary=cmd,
+            why="fixture incomplete classifier scope",
+            shape=dict(invalid_shape),
+            display=cmd,
+        )
+
+    monkeypatch.setattr(risk, "assess_tool_call", broken_classifier)
+    r1 = call(cmd, tool_call_id="inv-rec-1")
+    assert r1 is not None and r1["action"] == "approve"
+    consent("inv-rec-1", r1["rule_key"])
+    post(cmd, "inv-rec-1", status="ok", terminal_foreground_completed=True)
+    r2 = call("./scripts/other-unclassified.sh", tool_call_id="inv-rec-2")
+    assert r2 is not None and r2["action"] == "approve"
+    assert r1["rule_key"] != r2["rule_key"]
+    assert preferences.approval_count("uncertain", "terminal", invalid_shape) == 0
+
+
+@pytest.mark.parametrize("invalid_shape", _INVALID_PREFERENCE_SCOPES)
+def test_learned_preference_rejects_invalid_scope_on_lookup(monkeypatch, invalid_shape):
+    eng = FakeEngine(value="APPROVAL", confidence=0.9,
+                     probabilities={"ALLOW": 0.05, "APPROVAL": 0.90, "BLOCK": 0.05})
+    mount(eng)
+    gate.configure(mode="enforce", min_confidence=0.80, min_allow_probability=0.90,
+                   scope="selective", risk_preflight=True,
+                   learned_preferences=True, preference_min_samples=1)
+    cmd = "./scripts/fixture.sh"
+    valid_cmd = "./scripts/valid-lookup-control.sh --verify"
+    valid_shape = risk.assess_tool_call("terminal", {"command": valid_cmd, "workdir": WD}).shape
+
+    path = preferences.preferences_path()
+    seeded = {
+        "schema": "hermes-nerve-preferences/v2",
+        "shapes": {
+            preferences.shape_fingerprint(invalid_shape): {
+                "category": "uncertain",
+                "tool_name": "terminal",
+                "count": 10,
+            },
+            preferences.shape_fingerprint(valid_shape): {
+                "category": "uncertain",
+                "tool_name": "terminal",
+                "count": 10,
+            },
+        },
+    }
+    path.write_text(json.dumps(seeded), encoding="utf-8")
+
+    # Positive control: valid nonempty scope retrieves stored preference and auto-allows.
+    assert preferences.approval_count("uncertain", "terminal", valid_shape) == 10
+    assert preferences.learned_allow("uncertain", "terminal", valid_shape, 1) is True
+    assert call(valid_cmd, tool_call_id="pos-lkp-1") is None
+
+    # Lookup side: invalid/empty scope must never retrieve or reuse stored preferences.
+    assert preferences.approval_count("uncertain", "terminal", invalid_shape) == 0
+    assert preferences.learned_allow("uncertain", "terminal", invalid_shape, 1) is False
+
+    def broken_classifier(tool_name, call_args, workdir=None):
+        if invalid_shape == {}:
+            raise RuntimeError("classifier failure")
+        return risk.RiskAssessment(
+            risk.UNCERTAIN, tool_name,
+            action_label="Incomplete scope fixture",
+            summary=cmd,
+            why="fixture incomplete classifier scope",
+            shape=dict(invalid_shape),
+            display=cmd,
+        )
+
+    monkeypatch.setattr(risk, "assess_tool_call", broken_classifier)
+    res = call(cmd, tool_call_id="inv-lkp-1")
+    assert res is not None and res["action"] == "approve"
 
 
 def test_consequential_class_is_never_learned():
