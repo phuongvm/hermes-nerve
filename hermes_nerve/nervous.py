@@ -271,6 +271,7 @@ class AssignmentProgress:
     produced_outputs: set[str] = field(default_factory=set)
     observation_seq: int = 0
     admitted_prerequisite_calls: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_RETAINED_RECEIPTS))
+    progress_blocked_calls: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_RETAINED_RECEIPTS))
     receipts: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=MAX_RETAINED_RECEIPTS))
 
 
@@ -1270,8 +1271,10 @@ class NervousSystem:
                 "origin_tool": tool_name,
                 "origin_event_id": event_id,
             }
-        if status == "blocked" and kwargs.get("error_type") == "prerequisite_reader_unavailable":
-            # The host refused dispatch. Count the observation, not a tool failure.
+        raw_error_type = str(kwargs.get("error_type") or "")
+        raw_call_id_early = str(kwargs.get("tool_call_id") or "")
+        if status == "blocked" and raw_error_type.startswith("prerequisite_"):
+            # The host refused prerequisite dispatch. Count the observation, not a tool failure.
             state = self._resolve_turn(
                 turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""),
             )
@@ -1285,16 +1288,45 @@ class NervousSystem:
                         stage="post_tool",
                         tool_name=tool_name,
                         args=args,
-                        tool_call_id=kwargs.get("tool_call_id") or "",
+                        tool_call_id=raw_call_id_early,
                         action_fp=action_fp,
-                        guard_disposition="prerequisite_reader_unavailable",
+                        guard_disposition=raw_error_type,
                         decision="observe",
                         outcome="blocked",
                         prereq_snap=prereq_snap,
                         is_prerequisite_read=True,
                     )
                 self._log_receipt(receipt)
-            return {"accepted": True, "forwarded": False, "reason": "prerequisite_reader_unavailable"}
+            return {"accepted": True, "forwarded": False, "reason": raw_error_type}
+        if status == "blocked" and raw_error_type == "plugin_block" and raw_call_id_early:
+            state = self._resolve_turn(
+                turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""),
+            )
+            if state is not None:
+                prereq_snap = self._snapshot_prerequisite_capacity(state)
+                action_fp = tool_action_fingerprint(tool_name, args)
+                self_progress_block = False
+                receipt = None
+                with self._lock:
+                    if raw_call_id_early in state.progress.progress_blocked_calls:
+                        self_progress_block = True
+                        state.progress.tool_actions += 1
+                        receipt = self._try_build_receipt_locked(
+                            state,
+                            stage="post_tool",
+                            tool_name=tool_name,
+                            args=args,
+                            tool_call_id=raw_call_id_early,
+                            action_fp=action_fp,
+                            guard_disposition="progress_stall_blocked",
+                            decision="observe",
+                            outcome="blocked",
+                            prereq_snap=prereq_snap,
+                            is_prerequisite_read=False,
+                        )
+                if self_progress_block:
+                    self._log_receipt(receipt)
+                    return {"accepted": True, "forwarded": False, "reason": "progress-stall-blocked"}
         risk, risk_reasons = infer_tool_risk(tool_name, status)
         result = str(kwargs.get("result") or "")
         error_message = str(kwargs.get("error_message") or "")
@@ -1676,6 +1708,8 @@ class NervousSystem:
                                 "A scratch or unrelated file will not clear the guard."
                             ),
                         }
+                        if raw_call_id:
+                            state.progress.progress_blocked_calls.append(raw_call_id)
                         guard_disp, dec, out_tok = "progress_stall_blocked", "block", "blocked"
                 elif directive.control in BLOCKING_CONTROLS and same_action:
                     directive.attempted_overrides += 1

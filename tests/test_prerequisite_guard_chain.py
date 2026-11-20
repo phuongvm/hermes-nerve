@@ -114,6 +114,33 @@ def dispatch(chain, call_id="candidate"):
     return json.loads(result)["error"]
 
 
+def dispatch_allowed_prerequisite(chain, monkeypatch, call_id="candidate"):
+    executor = chain.executor
+    monkeypatch.setattr(executor, "_begin_tool_execution", lambda *_: None)
+    state = executor._ManagedToolResult(None, chain.args, [], False, False)
+    ref = executor._ToolCallRef(chain.tool, chain.args, "fixture-task", call_id, [])
+
+    def unexpected_execution(_args):
+        pytest.fail("A prerequisite must not fall back to the ordinary handler")
+
+    result = executor._dispatch_authorized_once(
+        chain.agent, state, ref, execute=unexpected_execution,
+        scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
+    )
+    assert not state.blocked
+    for cb in chain.manager._hooks.get("post_tool_call", []):
+        cb(
+            tool_name=chain.tool,
+            args=chain.args,
+            result=result,
+            status="ok",
+            turn_id="turn",
+            session_id="actor",
+            tool_call_id=call_id,
+        )
+    return json.loads(result)
+
+
 @pytest.mark.parametrize("case", ["no-veto", "deny", "approval-denied", "approval-accepted", "critical-error"])
 def test_registered_chain_preserves_downstream_authority(chain, monkeypatch, case):
     from tools import approval
@@ -131,12 +158,17 @@ def test_registered_chain_preserves_downstream_authority(chain, monkeypatch, cas
         "approval-accepted": {"action": "approve", "message": "fixture approval", "rule_key": "fixture:rule"},
         "critical-error": RuntimeError("fixture critical error"),
     }.get(case)
-    expected = {
-        "no-veto": "verified reader unavailable", "deny": "independent veto",
-        "approval-denied": "native approval refused", "approval-accepted": "verified reader unavailable",
-        "critical-error": "native approval refused",
-    }
-    assert expected[case] in dispatch(chain).lower()
+    if case in {"no-veto", "approval-accepted"}:
+        payload = dispatch_allowed_prerequisite(chain, monkeypatch)
+        assert payload["ok"] is True
+        assert payload["change"] == chain.args["change"]
+    else:
+        expected = {
+            "deny": "independent veto",
+            "approval-denied": "native approval refused",
+            "critical-error": "native approval refused",
+        }
+        assert expected[case] in dispatch(chain).lower()
     assert chain.gate_events == ["candidate"]
     assert len(approvals) == (0 if case in {"no-veto", "deny"} else 1)
     if case == "critical-error":
@@ -234,7 +266,7 @@ def test_missing_public_host_capability_keeps_the_progress_veto(chain):
     assert chain.reservations.reserve_read(chain.intent, "actor", "probe", chain.tool, chain.args) == "reserved"
 
 
-def test_public_capability_matches_only_the_current_host_call(chain):
+def test_public_capability_matches_only_the_current_host_call(chain, monkeypatch):
     reserve = chain.ctx.reserve_prerequisite_read
     identity = dict(session_id="actor", assignment_id=chain.intent.assignment_id,
                     tool_call_id="candidate", tool_name=chain.tool)
@@ -246,7 +278,8 @@ def test_public_capability_matches_only_the_current_host_call(chain):
             decisions.append(reserve(**{**identity, field: "unrelated"}))
 
     chain.manager._hooks["pre_tool_call"].insert(0, probe)
-    assert "verified reader unavailable" in dispatch(chain).lower()
+    payload = dispatch_allowed_prerequisite(chain, monkeypatch)
+    assert payload["ok"] is True
     assert decisions == ["unavailable"] * len(identity)
     assert chain.gate_events == ["candidate"]
     assert reserve(**identity) == "unavailable"
@@ -268,7 +301,7 @@ def test_cleanup_error_invalidates_the_ticket_and_preserves_veto(chain, monkeypa
 
 @pytest.mark.parametrize("chain", ["real-gate"], indirect=True)
 def test_accepted_approval_does_not_learn_from_host_refusal(chain, monkeypatch):
-    from tools import approval
+    from tools import approval, file_tools_paths
 
     gate = chain.gate
     assessment = gate.risk.assess_tool_call(chain.tool, chain.args)
@@ -287,9 +320,10 @@ def test_accepted_approval_does_not_learn_from_host_refusal(chain, monkeypatch):
 
     monkeypatch.setattr(gate, "evaluate_tool_call", evaluate)
     monkeypatch.setattr(approval, "request_tool_approval", approve)
+    monkeypatch.setattr(file_tools_paths, "_terminal_env_type_for_task", lambda *_a, **_kw: "ssh")
     shape = (assessment.category, chain.tool, assessment.shape)
     assert gate.prefs.approval_count(*shape) == 0
-    assert "verified reader unavailable" in dispatch(chain).lower()
+    assert "unsupported_backend" in dispatch(chain).lower()
     assert evaluations == [chain.tool]
     assert approvals == [(chain.tool, gate.prefs.scoped_rule_key(*shape))]
     assert gate.prefs.consume_pending(("actor", "turn", "candidate")) is None
@@ -648,3 +682,153 @@ def test_registered_chain_dispatches_verified_read_file_beyond_stall_and_records
         assert secret_tok not in raw_receipts_json and secret_tok not in disk_text
         assert body_sentinel not in raw_receipts_json and body_sentinel not in disk_text
     system.configure(enabled=False)
+
+
+@pytest.mark.parametrize(
+    "tool_case",
+    [
+        "read_file",
+        "skill_view",
+        "openspec_status",
+        "openspec_instructions",
+        "openspec_spec_show",
+        "openspec_spec_list",
+    ],
+)
+def test_registered_chain_all_six_bounded_adapters_succeed_beyond_stall(tmp_path, monkeypatch, tool_case):
+    import subprocess
+
+    source = os.environ.get("HERMES_TASK_INTENT_HOST")
+    if not source:
+        pytest.skip("Set HERMES_TASK_INTENT_HOST to the paired Hermes worktree")
+    host = Path(source).resolve()
+    monkeypatch.syspath_prepend(str(host))
+    from agent import delegation_context as dc, tool_executor as executor
+    from agent.prerequisite import catalog, reader
+    from hermes_cli import plugins
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_NERVE_NERVOUS_EVENTS", str(tmp_path / "nervous.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_OUTCOMES", str(tmp_path / "outcomes.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_POLICY_MEMORY", str(tmp_path / "policy.jsonl"))
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_TASK_ID", "HERMES_NERVE_REMOTE_CONTROL_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_kw: pytest.fail("Subprocess forbidden in bounded adapters"))
+
+    plugin = load_plugin()
+    system = plugin.nervous.NervousSystem(
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("No provider calls"))
+    )
+    monkeypatch.setattr(plugin.nervous, "_default", system)
+    monkeypatch.setattr(plugin.gate, "pre_tool_call", lambda **_kw: None)
+    monkeypatch.setattr(plugin.work_hooks, "pre_tool_call", lambda **_kw: None)
+
+    ctx = Ctx(
+        tmp_path,
+        {
+            "nervous_turn_admission": False,
+            "nervous_local_learning": False,
+            "nervous_policy_memory_enabled": False,
+            "nervous_call_threshold": 1.0,
+            "prerequisite_max_operations": 2,
+        },
+    )
+    host_ctx = plugins.PluginContext(plugins.PluginManifest(name="nerve"), plugins.PluginManager(str(tmp_path)))
+    monkeypatch.setattr(ctx, "reserve_prerequisite_read", host_ctx.reserve_prerequisite_read, raising=False)
+    plugin.register(ctx)
+
+    manager = plugins.PluginManager(str(tmp_path))
+    manager._hooks["pre_tool_call"] = [cb for event, cb in ctx.hooks if event == "pre_tool_call"]
+    manager._hooks["post_tool_call"] = [cb for event, cb in ctx.hooks if event == "post_tool_call"]
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+
+    fixture = runpy.run_path(str(host / "tests/tools/proposal_catalog_fixture.py"))
+    planning = tmp_path / "planning"
+    entry = fixture["proposal_entry"](planning)
+    change = fixture["CHANGE"]
+    selection = catalog.freeze_proposal_catalog(change, entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: selection)
+
+    args_by_tool = {
+        "read_file": {"path": str(planning / "rules/AGENTS.md"), "offset": 1, "limit": 20},
+        "skill_view": {"name": "verification-before-claim", "file_path": "references/completion-gate.md"},
+        "openspec_status": {"workdir": str(planning), "change": change},
+        "openspec_instructions": {"workdir": str(planning), "change": change, "artifact": "proposal"},
+        "openspec_spec_show": {"workdir": str(planning), "spec": "nerve-reflex-resilience"},
+        "openspec_spec_list": {"workdir": str(planning)},
+    }
+    tool_args = args_by_tool[tool_case]
+
+    scope = dict(actor_session_id="actor", parent_session_id="parent", goal="Write proposal.md.", context=None)
+    with dc.native_task_intent(**scope) as intent:
+        system.start_turn(
+            user_message="Write proposal.md.",
+            session_id="actor",
+            parent_session_id="parent",
+            turn_id="turn-matrix",
+            task_intent=intent,
+        )
+        for i in range(12):
+            system.observe_tool_call(
+                tool_name="read_file",
+                args={"path": "notes.md"},
+                status="ok",
+                result="fixture",
+                turn_id="turn-matrix",
+                session_id="actor",
+                tool_call_id=f"obs-{i}",
+            )
+        agent = SimpleNamespace(
+            session_id="actor",
+            _parent_session_id="parent",
+            _current_turn_id="turn-matrix",
+            tool_progress_callback=None,
+            _tool_guardrails=SimpleNamespace(before_call=lambda *_: SimpleNamespace(allows_execution=True)),
+        )
+        monkeypatch.setattr(executor, "_begin_tool_execution", lambda *_: None)
+        state = executor._ManagedToolResult(None, dict(tool_args), [], False, False)
+        ref = executor._ToolCallRef(tool_case, dict(tool_args), "task-m", f"call-{tool_case}", [])
+        with reader.measure_physical_reads() as metrics:
+            raw = executor._dispatch_authorized_once(
+                agent,
+                state,
+                ref,
+                execute=lambda _a: pytest.fail(f"Legacy handler forbidden for {tool_case}"),
+                scope_block=None,
+                display_index=None,
+                begin_execution=None,
+                authorization_gate=None,
+            )
+        assert not state.blocked
+        assert metrics.bytes_read > 0
+        for cb in manager._hooks["post_tool_call"]:
+            cb(
+                tool_name=tool_case,
+                args=tool_args,
+                result=raw,
+                status="ok",
+                turn_id="turn-matrix",
+                session_id="actor",
+                tool_call_id=f"call-{tool_case}",
+            )
+        parsed = json.loads(raw)
+        assert parsed.get("ok") is True or parsed.get("success") is True or "content" in parsed
+        receipts = [
+            r for r in system.accounting_receipts(session_id="actor", assignment_id=intent.assignment_id)
+            if r["tool_call_id"] == f"call-{tool_case}"
+        ]
+        assert [r["stage"] for r in receipts] == ["pre_tool", "post_tool"]
+        assert receipts[1]["operation_category"] == "prerequisite_read"
+        assert receipts[1]["counters"]["tool_actions"] == 13
+    system.configure(enabled=False)
+
+
+def test_progress_stall_remains_active_across_repeated_progress_guard_blocks(chain, monkeypatch):
+    payload = dispatch_allowed_prerequisite(chain, monkeypatch, call_id="slot-1")
+    assert payload["ok"] is True
+    assert "progress guard" in dispatch(chain, "exhausted-1").lower()
+    assert chain.system.status(turn_id="turn")["active_control"]["source"] == "local-progress-stall"
+
+    chain.args = {"workdir": chain.args["workdir"], "change": "different-change-slug"}
+    assert "progress guard" in dispatch(chain, "still-stalled-2").lower()
+    assert chain.system.status(turn_id="turn")["active_control"]["source"] == "local-progress-stall"
