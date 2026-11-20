@@ -487,3 +487,164 @@ def test_classifier_scope_error_neither_records_nor_reuses_preference(chain, mon
     dispatch_terminal(valid_args["command"], "valid-2")
     assert len(prompts) == 3
     assert gate.prefs.learned_allow("uncertain", "terminal", valid_shape, 1) is True
+
+
+def test_registered_chain_dispatches_verified_read_file_beyond_stall_and_records_nonsecret_receipts(
+    tmp_path, monkeypatch
+):
+    source = os.environ.get("HERMES_TASK_INTENT_HOST")
+    if not source:
+        pytest.skip("Set HERMES_TASK_INTENT_HOST to the paired Hermes worktree")
+    host = Path(source).resolve()
+    monkeypatch.syspath_prepend(str(host))
+    from agent import delegation_context as dc, tool_executor as executor
+    from agent.prerequisite import catalog, reader
+    from hermes_cli import plugins
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    events_path = tmp_path / "nervous.jsonl"
+    monkeypatch.setenv("HERMES_NERVE_NERVOUS_EVENTS", str(events_path))
+    monkeypatch.setenv("HERMES_NERVE_OUTCOMES", str(tmp_path / "outcomes.jsonl"))
+    monkeypatch.setenv("HERMES_NERVE_POLICY_MEMORY", str(tmp_path / "policy.jsonl"))
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_TASK_ID", "HERMES_NERVE_REMOTE_CONTROL_FILE"):
+        monkeypatch.delenv(key, raising=False)
+
+    plugin = load_plugin()
+    system = plugin.nervous.NervousSystem(
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("No provider calls"))
+    )
+    monkeypatch.setattr(plugin.nervous, "_default", system)
+    monkeypatch.setattr(plugin.gate, "pre_tool_call", lambda **_kw: None)
+    monkeypatch.setattr(plugin.work_hooks, "pre_tool_call", lambda **_kw: None)
+
+    ctx = Ctx(
+        tmp_path,
+        {
+            "nervous_turn_admission": False,
+            "nervous_local_learning": False,
+            "nervous_policy_memory_enabled": False,
+            "nervous_call_threshold": 1.0,
+            "prerequisite_max_operations": 4,
+        },
+    )
+    host_ctx = plugins.PluginContext(plugins.PluginManifest(name="nerve"), plugins.PluginManager(str(tmp_path)))
+    monkeypatch.setattr(ctx, "reserve_prerequisite_read", host_ctx.reserve_prerequisite_read, raising=False)
+    plugin.register(ctx)
+
+    manager = plugins.PluginManager(str(tmp_path))
+    manager._hooks["pre_tool_call"] = [cb for event, cb in ctx.hooks if event == "pre_tool_call"]
+    manager._hooks["post_tool_call"] = [cb for event, cb in ctx.hooks if event == "post_tool_call"]
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
+
+    fixture = runpy.run_path(str(host / "tests/tools/proposal_catalog_fixture.py"))
+    planning = tmp_path / "planning"
+    entry = fixture["proposal_entry"](planning)
+    secret_tok = "sk-chainReceiptSecret1234567890abcdef"
+    body_sentinel = "CHAIN_PREREQ_BODY_SENTINEL_5519"
+    agents_doc = planning / "rules" / "AGENTS.md"
+    raw_bytes = f"# Rules\n{body_sentinel}\nTOKEN={secret_tok}\n".encode("utf-8")
+    agents_doc.write_bytes(raw_bytes)
+    st = agents_doc.lstat()
+    from hashlib import sha256
+
+    entry["resources"]["governance/AGENTS.md"] = {
+        "path": str(agents_doc),
+        "device": st.st_dev,
+        "inode": st.st_ino,
+        "size": st.st_size,
+        "max_file_bytes": 1024,
+        "sha256": sha256(raw_bytes).hexdigest(),
+    }
+    selection = catalog.freeze_proposal_catalog(fixture["CHANGE"], entry)
+    monkeypatch.setattr(dc, "child_proposal_selection", lambda *_a, **_kw: selection)
+
+    scope = dict(actor_session_id="actor", parent_session_id="parent", goal="Write proposal.md.", context=None)
+    with dc.native_task_intent(**scope) as intent:
+        system.start_turn(
+            user_message="Write proposal.md.",
+            session_id="actor",
+            parent_session_id="parent",
+            turn_id="turn-13",
+            task_intent=intent,
+        )
+        for i in range(12):
+            system.observe_tool_call(
+                tool_name="read_file",
+                args={"path": "notes.md"},
+                status="ok",
+                result="fixture",
+                turn_id="turn-13",
+                session_id="actor",
+                tool_call_id=f"obs-{i}",
+            )
+        assert system.status(turn_id="turn-13")["active_control"]["source"] == "local-progress-stall"
+
+        agent = SimpleNamespace(
+            session_id="actor",
+            _parent_session_id="parent",
+            _current_turn_id="turn-13",
+            tool_progress_callback=None,
+            _tool_guardrails=SimpleNamespace(before_call=lambda *_: SimpleNamespace(allows_execution=True)),
+        )
+        monkeypatch.setattr(executor, "_begin_tool_execution", lambda *_: None)
+        monkeypatch.setattr(executor, "_commit_tool_result", lambda *_a, **_kw: None)
+
+        read_args = {"path": str(agents_doc), "offset": 1, "limit": 20}
+        ref = executor._ToolCallRef("read_file", dict(read_args), "task-chain", "prereq-13", [])
+
+        def run_mw(_agent, **kwargs):
+            st_res = executor._ManagedToolResult(None, dict(read_args), [], False, True)
+            st_res.result = executor._dispatch_authorized_once(
+                agent,
+                st_res,
+                ref,
+                execute=kwargs["execute"],
+                scope_block=None,
+                display_index=None,
+                begin_execution=None,
+                authorization_gate=None,
+            )
+            return st_res
+
+        monkeypatch.setattr(executor, "_run_sequential_tool_execution_middleware", run_mw)
+        plan = executor._SequentialDispatch(
+            execute=lambda _a: pytest.fail("Must not fall back to legacy read_file handler"),
+            error_result=lambda exc: f"Error: {exc}",
+            error_log="err %s: %s",
+            finish_spinner=False,
+        )
+        messages = []
+        with reader.measure_physical_reads() as metrics:
+            state, duration = executor._run_sequential_call(
+                agent, plan, ref, scope_block=None, messages=messages, remaining_calls=[],
+                display_index=1, tool_start_time=executor.time.time(),
+            )
+            assert not state.blocked
+            executor._publish_sequential_result(
+                agent, messages, ref, state, tool_duration=duration, index=0, budget=None, transform_applied=True,
+            )
+
+        assert metrics.bytes_read == len(raw_bytes)
+        payload = json.loads(state.result)
+        assert body_sentinel in payload["content"]
+        assert secret_tok not in payload["content"]
+
+        # Lifetime tool_actions increased monotonically to 13 rather than resetting.
+        assert system.status(turn_id="turn-13")["tool_actions"] == 13
+        call_receipts = [
+            r for r in system.accounting_receipts(session_id="actor", assignment_id=intent.assignment_id)
+            if r["tool_call_id"] == "prereq-13"
+        ]
+        assert [r["stage"] for r in call_receipts] == ["pre_tool", "post_tool"]
+        assert call_receipts[0]["guard_disposition"] == "prerequisite_admitted"
+        assert call_receipts[0]["active_control_source"] == "local-progress-stall"
+        assert call_receipts[1]["operation_category"] == "prerequisite_read"
+        assert call_receipts[1]["counters"]["tool_actions"] == 13
+        assert call_receipts[1]["prerequisite"]["operations_reserved"] == 1
+        assert call_receipts[1]["prerequisite"]["source_bytes_reserved"] == 1024
+
+        raw_receipts_json = json.dumps(system.accounting_receipts(session_id="actor", assignment_id=intent.assignment_id))
+        disk_text = events_path.read_text(encoding="utf-8")
+        assert secret_tok not in raw_receipts_json and secret_tok not in disk_text
+        assert body_sentinel not in raw_receipts_json and body_sentinel not in disk_text
+    system.configure(enabled=False)

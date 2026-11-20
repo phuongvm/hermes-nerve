@@ -24,13 +24,19 @@ import unicodedata
 import threading
 import time
 import uuid
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref as weakref_ref
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .accounting_receipts import (
+    MAX_RETAINED_RECEIPTS,
+    build_accounting_receipt,
+    classify_operation_category,
+    verify_accounting_receipt as _verify_receipt_payload,
+)
 from .engine import DecisionEngine
 from . import experience
 from .jsonl import append_jsonl
@@ -263,6 +269,9 @@ class AssignmentProgress:
     successful_relevant_mutations: int = 0
     verified_test_passes: int = 0
     produced_outputs: set[str] = field(default_factory=set)
+    observation_seq: int = 0
+    admitted_prerequisite_calls: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_RETAINED_RECEIPTS))
+    receipts: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=MAX_RETAINED_RECEIPTS))
 
 
 @dataclass
@@ -296,6 +305,8 @@ class TurnState:
     requested_paths: tuple[str, ...] = ()
     task_intent_disposition: str = "missing"
     assignment_id: str = ""
+    parent_session_id: str = ""
+    task_intent_ref: Callable[[], Any] | None = None
     progress: AssignmentProgress = field(default_factory=AssignmentProgress)
     required_outputs: tuple[str, ...] = ()
     progress_challenge_issued: bool = False
@@ -310,6 +321,8 @@ class NervousSystem:
         self._turns: dict[str, TurnState] = {}
         self._session_turn: dict[str, str] = {}
         self._assignment_progress: WeakKeyDictionary = WeakKeyDictionary()
+        self._observation_seq: int = 0
+        self._recent_receipts: deque[dict[str, Any]] = deque(maxlen=MAX_RETAINED_RECEIPTS)
         self._tasks: queue.Queue[tuple[str, dict[str, Any], contextvars.Context]] = queue.Queue(maxsize=128)
         self._worker: threading.Thread | None = None
         self._stopping = False
@@ -523,6 +536,8 @@ class NervousSystem:
                 verification_required=progress_verification_required(intent_message),
                 requested_paths=progress_requested_paths(intent_message),
                 task_intent_disposition=disposition, assignment_id=assignment_id,
+                parent_session_id=str(parent_session_id or ""),
+                task_intent_ref=weakref_ref(task_intent) if disposition == "trusted" else None,
                 required_outputs=progress_requested_paths(intent_message, produced_only=True) if disposition == "trusted" else (),
             )
             first_assignment_turn = False
@@ -579,6 +594,166 @@ class NervousSystem:
                 )
         except Exception:
             self._log("prerequisite_initialization_failed", {"assignment_id": task_intent.assignment_id})
+
+    @staticmethod
+    def _snapshot_prerequisite_capacity(state: TurnState | None) -> dict[str, Any] | None:
+        """Query host prerequisite counters outside self._lock to preserve lock ordering."""
+        if state is None or state.task_intent_disposition != "trusted" or not state.assignment_id:
+            return None
+        try:
+            from agent.prerequisite.reservations import (
+                accounting_snapshot,
+                preparation_snapshot_for_intent,
+            )
+        except ImportError:
+            return None
+        try:
+            snap = accounting_snapshot(state.session_id, state.parent_session_id, state.assignment_id)
+            if snap is None and state.task_intent_ref is not None:
+                intent_obj = state.task_intent_ref()
+                if (
+                    intent_obj is not None
+                    and getattr(intent_obj, "actor_session_id", None) == state.session_id
+                    and getattr(intent_obj, "assignment_id", None) == state.assignment_id
+                ):
+                    snap = preparation_snapshot_for_intent(intent_obj)
+            return snap
+        except Exception:
+            return None
+
+    def _build_receipt_locked(
+        self,
+        state: TurnState,
+        *,
+        stage: str,
+        tool_name: str = "",
+        args: dict[str, Any] | None = None,
+        tool_call_id: Any = "",
+        action_fp: str = "",
+        guard_disposition: str,
+        decision: str,
+        outcome: str,
+        prereq_snap: dict[str, Any] | None = None,
+        is_prerequisite_read: bool = False,
+        active_control_source_override: str | None = None,
+        outputs_satisfied_override: bool | None = None,
+    ) -> dict[str, Any]:
+        self._observation_seq += 1
+        state.progress.observation_seq += 1
+        safe_args = args if isinstance(args, dict) else {}
+        trusted = state.task_intent_disposition == "trusted"
+        category = classify_operation_category(
+            stage=stage,
+            tool_name=tool_name,
+            args=safe_args,
+            is_prerequisite_read=is_prerequisite_read,
+            change_required=state.change_required,
+            trusted_intent=trusted,
+            requested_paths=state.requested_paths,
+        )
+        if outputs_satisfied_override is not None:
+            outputs_satisfied = outputs_satisfied_override
+        elif not state.change_required:
+            outputs_satisfied = True
+        elif state.required_outputs:
+            outputs_satisfied = (
+                state.progress.successful_relevant_mutations > 0
+                and all(target in state.progress.produced_outputs for target in state.required_outputs)
+            )
+        else:
+            outputs_satisfied = state.progress.successful_relevant_mutations > 0
+        verification_satisfied = (not state.verification_required) or (state.progress.verified_test_passes > 0)
+        control_source = (
+            active_control_source_override
+            if active_control_source_override is not None
+            else (state.active_control.source if state.active_control is not None else "")
+        )
+        receipt = build_accounting_receipt(
+            observation_seq=self._observation_seq,
+            assignment_observation_seq=state.progress.observation_seq,
+            actor_session_id=state.session_id,
+            parent_session_id=state.parent_session_id,
+            assignment_id=state.assignment_id,
+            task_intent_disposition=state.task_intent_disposition,
+            turn_id=state.turn_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            action_fingerprint=action_fp,
+            stage=stage,
+            operation_category=category,
+            guard_disposition=guard_disposition,
+            active_control_source=control_source,
+            decision=decision,
+            outcome=outcome,
+            counters={
+                "tool_actions": state.progress.tool_actions,
+                "mutation_attempts": state.progress.mutation_attempts,
+                "relevant_mutation_attempts": state.progress.relevant_mutation_attempts,
+                "successful_relevant_mutations": state.progress.successful_relevant_mutations,
+                "verified_test_passes": state.progress.verified_test_passes,
+                "produced_outputs_count": len(state.progress.produced_outputs),
+                "required_outputs_count": len(state.required_outputs),
+            },
+            prerequisite=prereq_snap,
+            output_verification={
+                "change_required": state.change_required,
+                "verification_required": state.verification_required,
+                "outputs_satisfied": outputs_satisfied,
+                "verification_satisfied": verification_satisfied,
+            },
+        )
+        state.progress.receipts.append(receipt)
+        self._recent_receipts.append(receipt)
+        return receipt
+
+    def _try_build_receipt_locked(self, state: TurnState, **kwargs: Any) -> dict[str, Any] | None:
+        """Build an accounting receipt without letting bookkeeping errors erase active guards."""
+        try:
+            return self._build_receipt_locked(state, **kwargs)
+        except Exception:
+            self._metrics["accounting_receipt_errors"] += 1
+            return None
+
+    def _log_receipt(self, receipt: dict[str, Any] | None) -> None:
+        if receipt is not None:
+            self._log("accounting_receipt", receipt)
+
+    def accounting_receipts(
+        self,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        assignment_id: str = "",
+        limit: int = 128,
+    ) -> list[dict[str, Any]]:
+        """Return bounded nonsecret accounting receipts ordered by observation_seq."""
+        cap = max(0, min(MAX_RETAINED_RECEIPTS, int(limit or 0)))
+        if cap == 0:
+            return []
+        with self._lock:
+            rows = [
+                json.loads(json.dumps(r))
+                for r in self._recent_receipts
+                if (not session_id or r.get("actor_session_id") == session_id)
+                and (not turn_id or r.get("turn_id") == turn_id)
+                and (not assignment_id or r.get("assignment_id") == assignment_id)
+            ]
+        rows.sort(key=lambda item: int(item.get("observation_seq", 0)))
+        return rows[-cap:]
+
+    def verify_accounting_receipt(
+        self,
+        receipt: dict[str, Any],
+        *,
+        actor_session_id: str,
+        assignment_id: str,
+    ) -> bool:
+        """Verify receipt schema, cryptographic digest, and actor/assignment binding."""
+        return _verify_receipt_payload(
+            receipt,
+            actor_session_id=actor_session_id,
+            assignment_id=assignment_id,
+        )
 
     def _do_admission(self, payload: dict[str, Any]) -> None:
         tid = str(payload.get("turn_id") or "")
@@ -1101,8 +1276,24 @@ class NervousSystem:
                 turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""),
             )
             if state is not None:
+                prereq_snap = self._snapshot_prerequisite_capacity(state)
+                action_fp = tool_action_fingerprint(tool_name, args)
                 with self._lock:
                     state.progress.tool_actions += 1
+                    receipt = self._try_build_receipt_locked(
+                        state,
+                        stage="post_tool",
+                        tool_name=tool_name,
+                        args=args,
+                        tool_call_id=kwargs.get("tool_call_id") or "",
+                        action_fp=action_fp,
+                        guard_disposition="prerequisite_reader_unavailable",
+                        decision="observe",
+                        outcome="blocked",
+                        prereq_snap=prereq_snap,
+                        is_prerequisite_read=True,
+                    )
+                self._log_receipt(receipt)
             return {"accepted": True, "forwarded": False, "reason": "prerequisite_reader_unavailable"}
         risk, risk_reasons = infer_tool_risk(tool_name, status)
         result = str(kwargs.get("result") or "")
@@ -1112,18 +1303,39 @@ class NervousSystem:
             "unexpected", "contradict", "mismatch", "failed", "failure", "error", "not found", "denied"
         ))
         event_type = "FAILURE" if is_failure else "TOOL_RESULT"
-        event_id = str(kwargs.get("tool_call_id") or uuid.uuid4().hex)
+        raw_call_id = str(kwargs.get("tool_call_id") or "")
+        event_id = raw_call_id or uuid.uuid4().hex
         action_fp = tool_action_fingerprint(tool_name, args)
-        fail_fp = ""
+        exit_code = kwargs.get("exit_code", kwargs.get("returncode"))
+        fail_fp = (
+            failure_fingerprint(
+                tool_name=tool_name,
+                args=args,
+                status=status,
+                result=result,
+                error_message=error_message,
+                exit_code=exit_code,
+            )
+            if is_failure
+            else ""
+        )
         repeat_count = 0
         deterministic_reason = _deterministic_failure_reason(status, result, error_message) if is_failure else ""
         policy_memory_reason = tool_wide_policy_reason(tool_name, status, result, error_message) if is_failure else ""
         env_failure = environment_failure(tool_name, args, status, result, error_message)
         state = self._resolve_turn(turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""))
+        post_receipt: dict[str, Any] | None = None
+        active_blocking = False
         if state is not None:
+            prereq_snap = self._snapshot_prerequisite_capacity(state)
             with self._lock:
                 state.progress.tool_actions += 1
                 kind = tool_kind(tool_name, args)
+                is_prereq = (
+                    bool(raw_call_id and raw_call_id in state.progress.admitted_prerequisite_calls)
+                    or str(kwargs.get("error_type") or "").startswith("prerequisite_")
+                )
+                guard_disp = "prerequisite_observed" if is_prereq else "observed"
                 if kind == "mutation":
                     state.progress.mutation_attempts += 1
                     if state.required_outputs and not is_failure and status.lower() in {"ok", "success", "passed"}:
@@ -1142,6 +1354,7 @@ class NervousSystem:
                     and not state.progress_challenge_issued
                 ):
                     self._activate_progress_stall_replan(state, event_id)
+                    guard_disp = "progress_stall_activated"
                 if (
                     not is_failure
                     and state.active_control is not None
@@ -1154,44 +1367,52 @@ class NervousSystem:
                         proposed_action_fingerprint=action_fp,
                     )
                     state.active_control = None
-        if is_failure and state is not None:
-            exit_code = kwargs.get("exit_code", kwargs.get("returncode"))
-            fail_fp = failure_fingerprint(
-                tool_name=tool_name,
-                args=args,
-                status=status,
-                result=result,
-                error_message=error_message,
-                exit_code=exit_code,
-            )
-            with self._lock:
-                episode = state.failure_episodes.get(fail_fp)
-                if episode is None:
-                    episode = FailureEpisode(
-                        fingerprint=fail_fp,
-                        action_fingerprint=action_fp,
-                        first_event_id=event_id,
+                if is_failure:
+                    episode = state.failure_episodes.get(fail_fp)
+                    if episode is None:
+                        episode = FailureEpisode(
+                            fingerprint=fail_fp,
+                            action_fingerprint=action_fp,
+                            first_event_id=event_id,
+                        )
+                        state.failure_episodes[fail_fp] = episode
+                        self._metrics["failure_episodes"] += 1
+                    episode.count += 1
+                    episode.last_event_id = event_id
+                    repeat_count = episode.count
+                    if repeat_count >= 2:
+                        self._metrics["repeated_failures_seen"] += 1
+                    if deterministic_reason and repeat_count == 1:
+                        self._activate_deterministic_failure_replan(state, episode, deterministic_reason)
+                        guard_disp = "deterministic_failure_activated"
+                    elif repeat_count >= self._config.repeated_failure_local_replan_at:
+                        self._activate_local_loop_breaker(state, episode)
+                        guard_disp = "loop_breaker_activated"
+                    active_blocking = (
+                        state.active_control is not None
+                        and state.active_control.control in BLOCKING_CONTROLS
                     )
-                    state.failure_episodes[fail_fp] = episode
-                    self._metrics["failure_episodes"] += 1
-                episode.count += 1
-                episode.last_event_id = event_id
-                repeat_count = episode.count
-                if repeat_count >= 2:
-                    self._metrics["repeated_failures_seen"] += 1
-                if deterministic_reason and repeat_count == 1:
-                    self._activate_deterministic_failure_replan(state, episode, deterministic_reason)
-                elif repeat_count >= self._config.repeated_failure_local_replan_at:
-                    self._activate_local_loop_breaker(state, episode)
-            active_blocking = (
-                state.active_control is not None
-                and state.active_control.control in BLOCKING_CONTROLS
-            )
-            if env_failure and action_fp not in state.environment_failure_actions:
-                state.environment_failure_actions.append(action_fp)
-                self._metrics["environment_toolchain_failures"] += 1
-                if len(state.environment_failure_actions) >= 2:
-                    self._activate_environment_thrash_replan(state, event_id)
+                    if env_failure and action_fp not in state.environment_failure_actions:
+                        state.environment_failure_actions.append(action_fp)
+                        self._metrics["environment_toolchain_failures"] += 1
+                        if len(state.environment_failure_actions) >= 2:
+                            self._activate_environment_thrash_replan(state, event_id)
+                            guard_disp = "env_thrash_activated"
+                outcome_tok = "error" if is_failure and not status else (status or ("error" if is_failure else "ok"))
+                post_receipt = self._try_build_receipt_locked(
+                    state,
+                    stage="post_tool",
+                    tool_name=tool_name,
+                    args=args,
+                    tool_call_id=raw_call_id or event_id,
+                    action_fp=action_fp,
+                    guard_disposition=guard_disp,
+                    decision="observe",
+                    outcome=outcome_tok,
+                    prereq_snap=prereq_snap,
+                    is_prerequisite_read=is_prereq,
+                )
+        if is_failure and state is not None:
             if (policy_memory_reason and repeat_count == 1
                     and self._policy_memory is not None and not active_blocking):
                 remembered = self._policy_memory.remember(
@@ -1204,6 +1425,7 @@ class NervousSystem:
                         self._metrics["policy_memory_records"] += 1
             if repeat_count >= 2:
                 event_type = "REPEATED_FAILURE"
+        self._log_receipt(post_receipt)
 
         event = {
             "type": event_type,
@@ -1275,16 +1497,32 @@ class NervousSystem:
             if self._policy_memory is not None and state.active_control is None
             else None
         )
+        proposed_fp = tool_action_fingerprint(tool_name, args)
+        raw_call_id = kwargs.get("tool_call_id") or ""
         if memory is not None:
+            prereq_snap = self._snapshot_prerequisite_capacity(state)
             with self._lock:
                 self._metrics["policy_memory_prevented_calls"] += 1
                 self._metrics["policy_memory_hits"] += 1
+                receipt = self._try_build_receipt_locked(
+                    state,
+                    stage="pre_tool",
+                    tool_name=tool_name,
+                    args=args,
+                    tool_call_id=raw_call_id,
+                    action_fp=proposed_fp,
+                    guard_disposition="policy_memory_blocked",
+                    decision="block",
+                    outcome="blocked",
+                    prereq_snap=prereq_snap,
+                )
             self._log("policy_memory_enforced", {
                 "tool_name": tool_name,
                 "reason": memory.reason,
                 "evidence_fingerprint": memory.evidence_fingerprint,
                 "expires_at_epoch": memory.expires_at_epoch,
             })
+            self._log_receipt(receipt)
             return {
                 "action": "block",
                 "message": (
@@ -1293,7 +1531,6 @@ class NervousSystem:
                     "automatically when the execution mode/config changes or its TTL elapses."
                 ),
             }
-        proposed_fp = tool_action_fingerprint(tool_name, args)
         with self._lock:
             progress = state.active_control
             eligible = (
@@ -1307,106 +1544,186 @@ class NervousSystem:
                 reserve_prerequisite_read, state, tool_name, kwargs.get("tool_call_id"),
             )
             if reservation == "error":
+                try:
+                    prereq_snap = self._snapshot_prerequisite_capacity(state)
+                    with self._lock:
+                        err_receipt = self._build_receipt_locked(
+                            state,
+                            stage="pre_tool",
+                            tool_name=tool_name,
+                            args=args,
+                            tool_call_id=raw_call_id,
+                            action_fp=proposed_fp,
+                            guard_disposition="prerequisite_bookkeeping_error",
+                            decision="block",
+                            outcome="error",
+                            prereq_snap=prereq_snap,
+                            active_control_source_override=progress.source if progress is not None else "",
+                        )
+                    self._log("accounting_receipt", err_receipt)
+                except Exception:
+                    pass
                 return {"action": "block", "message": "Nerve prerequisite bookkeeping unavailable; no read dispatched."}
-            with self._lock:
-                if reservation == "reserved" and not state.finished and state.active_control is progress:
-                    return None  # Decline only our progress veto; other callbacks still run.
+            if reservation == "reserved":
+                try:
+                    prereq_snap = self._snapshot_prerequisite_capacity(state)
+                    admitted_receipt = None
+                    with self._lock:
+                        if not state.finished and state.active_control is progress:
+                            if isinstance(raw_call_id, str) and raw_call_id:
+                                state.progress.admitted_prerequisite_calls.append(raw_call_id)
+                            admitted_receipt = self._build_receipt_locked(
+                                state,
+                                stage="pre_tool",
+                                tool_name=tool_name,
+                                args=args,
+                                tool_call_id=raw_call_id,
+                                action_fp=proposed_fp,
+                                guard_disposition="prerequisite_admitted",
+                                decision="allow",
+                                outcome="reserved",
+                                prereq_snap=prereq_snap,
+                                is_prerequisite_read=True,
+                                active_control_source_override=progress.source if progress is not None else "",
+                            )
+                    if admitted_receipt is not None:
+                        self._log("accounting_receipt", admitted_receipt)
+                        return None  # Decline only our progress veto; other callbacks still run.
+                except Exception:
+                    return {"action": "block", "message": "Nerve prerequisite bookkeeping unavailable; no read dispatched."}
+        prereq_snap = self._snapshot_prerequisite_capacity(state)
+        verdict: dict[str, Any] | None = None
+        control_log_payload: dict[str, Any] | None = None
         with self._lock:
             directive = state.active_control
+            pre_source = directive.source if directive is not None else ""
             if directive is None:
-                return None
-            same_action = bool(directive.action_fingerprint and proposed_fp == directive.action_fingerprint)
-            progress_control = directive.source == "local-progress-stall" and directive.control in BLOCKING_CONTROLS
-            environment_control = directive.source == "local-environment-thrash" and directive.control in BLOCKING_CONTROLS
-            mutation = tool_kind(tool_name, args) == "mutation"
-            relevant_mutation = mutation_is_relevant(tool_name, args, state.requested_paths) if mutation else False
-            if not directive.delivered:
-                directive.delivered = True
-                self._metrics["controls_delivered"] += 1
-                self._record_control_lifecycle(state, directive, stage="delivered", disposition="pre-tool")
-            if directive.control == "RETRY":
-                self._metrics["controls_followed"] += 1
-                self._record_control_lifecycle(
-                    state, directive, stage="next_action", disposition="followed",
-                    proposed_action_fingerprint=proposed_fp,
+                pre_receipt = self._try_build_receipt_locked(
+                    state,
+                    stage="pre_tool",
+                    tool_name=tool_name,
+                    args=args,
+                    tool_call_id=raw_call_id,
+                    action_fp=proposed_fp,
+                    guard_disposition="allowed",
+                    decision="allow",
+                    outcome="allowed",
+                    prereq_snap=prereq_snap,
+                    active_control_source_override="",
                 )
-                state.active_control = None
-                return None
-            if environment_control:
-                if environment_action(tool_name, args):
+            else:
+                same_action = bool(directive.action_fingerprint and proposed_fp == directive.action_fingerprint)
+                progress_control = directive.source == "local-progress-stall" and directive.control in BLOCKING_CONTROLS
+                environment_control = directive.source == "local-environment-thrash" and directive.control in BLOCKING_CONTROLS
+                mutation = tool_kind(tool_name, args) == "mutation"
+                relevant_mutation = mutation_is_relevant(tool_name, args, state.requested_paths) if mutation else False
+                if not directive.delivered:
+                    directive.delivered = True
+                    self._metrics["controls_delivered"] += 1
+                    self._record_control_lifecycle(state, directive, stage="delivered", disposition="pre-tool")
+                if directive.control == "RETRY":
+                    self._metrics["controls_followed"] += 1
+                    self._record_control_lifecycle(
+                        state, directive, stage="next_action", disposition="followed",
+                        proposed_action_fingerprint=proposed_fp,
+                    )
+                    state.active_control = None
+                    guard_disp, dec, out_tok = "control_followed", "allow", "allowed"
+                elif environment_control:
+                    if environment_action(tool_name, args):
+                        directive.attempted_overrides += 1
+                        self._metrics["control_override_attempts"] += 1
+                        self._metrics["controls_enforced"] += 1
+                        self._metrics["environment_thrash_prevented_calls"] += 1
+                        self._record_control_lifecycle(
+                            state, directive, stage="next_action", disposition="enforced",
+                            proposed_action_fingerprint=proposed_fp, attempted_override=True,
+                        )
+                        verdict = {
+                            "action": "block",
+                            "message": (
+                                "Nerve detected repeated environment/toolchain thrash. "
+                                "Inspect the repository's native test configuration or available runner "
+                                "before another package, virtualenv, or test-environment attempt."
+                            ),
+                        }
+                        guard_disp, dec, out_tok = "env_thrash_blocked", "block", "blocked"
+                    else:
+                        guard_disp, dec, out_tok = "allowed", "allow", "allowed"
+                elif progress_control and not relevant_mutation:
+                    if mutation:
+                        self._metrics["progress_irrelevant_mutations"] += 1
+                        self._log("progress_irrelevant_mutation", {
+                            **directive.as_dict(), "tool_name": tool_name,
+                            "proposed_action_fingerprint": proposed_fp,
+                            "requested_paths": list(state.requested_paths),
+                        })
+                        guard_disp, dec, out_tok = "unrelated_mutation_under_stall", "allow", "allowed"
+                    else:
+                        directive.attempted_overrides += 1
+                        self._metrics["control_override_attempts"] += 1
+                        self._metrics["controls_enforced"] += 1
+                        self._metrics["progress_stall_prevented_calls"] += 1
+                        self._record_control_lifecycle(
+                            state, directive, stage="next_action", disposition="enforced",
+                            proposed_action_fingerprint=proposed_fp, attempted_override=True,
+                        )
+                        verdict = {
+                            "action": "block",
+                            "message": (
+                                "Nerve progress guard requires task-relevant implementation now. "
+                                "Read/search/test-only actions are paused; mutation tools remain available. "
+                                "A scratch or unrelated file will not clear the guard."
+                            ),
+                        }
+                        guard_disp, dec, out_tok = "progress_stall_blocked", "block", "blocked"
+                elif directive.control in BLOCKING_CONTROLS and same_action:
                     directive.attempted_overrides += 1
                     self._metrics["control_override_attempts"] += 1
                     self._metrics["controls_enforced"] += 1
-                    self._metrics["environment_thrash_prevented_calls"] += 1
+                    if directive.failure_fingerprint in state.failure_episodes:
+                        state.failure_episodes[directive.failure_fingerprint].blocked_attempts += 1
                     self._record_control_lifecycle(
                         state, directive, stage="next_action", disposition="enforced",
                         proposed_action_fingerprint=proposed_fp, attempted_override=True,
                     )
-                    return {
-                        "action": "block",
-                        "message": (
-                            "Nerve detected repeated environment/toolchain thrash. "
-                            "Inspect the repository's native test configuration or available runner "
-                            "before another package, virtualenv, or test-environment attempt."
-                        ),
-                    }
-                # A non-environment diagnostic/recovery step is permitted, but the
-                # lease remains until post-tool observation confirms it succeeded.
-                return None
-            if progress_control and not relevant_mutation:
-                if mutation:
-                    # Permit experiments/scratch mutations, but do not let them
-                    # satisfy the progress lease or unlock more investigation.
-                    self._metrics["progress_irrelevant_mutations"] += 1
-                    self._log("progress_irrelevant_mutation", {
-                        **directive.as_dict(), "tool_name": tool_name,
+                    message = (
+                        f"Nerve {directive.control} control {directive.decision_id} prevents repeating the exact action "
+                        "that already failed. Choose a materially different diagnostic/recovery step"
+                        + (" or escalate." if directive.control == "ESCALATE" else ".")
+                    )
+                    control_log_payload = {
+                        **directive.as_dict(),
+                        "tool_name": tool_name,
                         "proposed_action_fingerprint": proposed_fp,
-                        "requested_paths": list(state.requested_paths),
-                    })
-                    return None
-                directive.attempted_overrides += 1
-                self._metrics["control_override_attempts"] += 1
-                self._metrics["controls_enforced"] += 1
-                self._metrics["progress_stall_prevented_calls"] += 1
-                self._record_control_lifecycle(
-                    state, directive, stage="next_action", disposition="enforced",
-                    proposed_action_fingerprint=proposed_fp, attempted_override=True,
+                    }
+                    verdict = {"action": "block", "message": message}
+                    guard_disp, dec, out_tok = "control_blocked", "block", "blocked"
+                else:
+                    self._metrics["controls_followed"] += 1
+                    self._record_control_lifecycle(
+                        state, directive, stage="next_action", disposition="followed",
+                        proposed_action_fingerprint=proposed_fp,
+                    )
+                    state.active_control = None
+                    guard_disp, dec, out_tok = "control_followed", "allow", "allowed"
+                pre_receipt = self._try_build_receipt_locked(
+                    state,
+                    stage="pre_tool",
+                    tool_name=tool_name,
+                    args=args,
+                    tool_call_id=raw_call_id,
+                    action_fp=proposed_fp,
+                    guard_disposition=guard_disp,
+                    decision=dec,
+                    outcome=out_tok,
+                    prereq_snap=prereq_snap,
+                    active_control_source_override=pre_source,
                 )
-                return {
-                    "action": "block",
-                    "message": (
-                        "Nerve progress guard requires task-relevant implementation now. "
-                        "Read/search/test-only actions are paused; mutation tools remain available. "
-                        "A scratch or unrelated file will not clear the guard."
-                    ),
-                }
-            if directive.control in BLOCKING_CONTROLS and same_action:
-                directive.attempted_overrides += 1
-                self._metrics["control_override_attempts"] += 1
-                self._metrics["controls_enforced"] += 1
-                if directive.failure_fingerprint in state.failure_episodes:
-                    state.failure_episodes[directive.failure_fingerprint].blocked_attempts += 1
-                self._record_control_lifecycle(
-                    state, directive, stage="next_action", disposition="enforced",
-                    proposed_action_fingerprint=proposed_fp, attempted_override=True,
-                )
-                message = (
-                    f"Nerve {directive.control} control {directive.decision_id} prevents repeating the exact action "
-                    "that already failed. Choose a materially different diagnostic/recovery step"
-                    + (" or escalate." if directive.control == "ESCALATE" else ".")
-                )
-                self._log("control_enforced", {**directive.as_dict(), "tool_name": tool_name, "proposed_action_fingerprint": proposed_fp})
-                return {"action": "block", "message": message}
-
-            # Any materially different tool action demonstrates that the replan /
-            # gather-evidence control affected trajectory. Consume the lease.
-            self._metrics["controls_followed"] += 1
-            self._record_control_lifecycle(
-                state, directive, stage="next_action", disposition="followed",
-                proposed_action_fingerprint=proposed_fp,
-            )
-            state.active_control = None
-        return None
+        if control_log_payload is not None:
+            self._log("control_enforced", control_log_payload)
+        self._log_receipt(pre_receipt)
+        return verdict
 
     @staticmethod
     def _reserve_progress_read(reserve, state: TurnState, tool: str, call_id: Any) -> str:
@@ -2046,6 +2363,7 @@ class NervousSystem:
         trusted_output = state.task_intent_disposition == "trusted" and state.change_required
         coding_change = trusted_output or (state.change_required and (bool(kwargs.get("coding")) or changed_paths_present))
         relevant_persisted = changed_paths_relevant(changed_paths, state.requested_paths) if changed_paths_present else None
+        prereq_snap = self._snapshot_prerequisite_capacity(state)
         with self._lock:
             no_relevant_attempt = coding_change and state.progress.relevant_mutation_attempts == 0
             no_relevant_persisted = coding_change and relevant_persisted is False
@@ -2061,6 +2379,24 @@ class NervousSystem:
             )
             if no_relevant_attempt or no_relevant_persisted or missing_verification:
                 self._metrics["progress_false_completion_prevented"] += 1
+                outcome_tok = (
+                    "no_relevant_mutation"
+                    if no_relevant_attempt
+                    else ("no_relevant_persisted" if no_relevant_persisted else "missing_verification")
+                )
+                shadow_mode = self._config.mode == "shadow"
+                if shadow_mode:
+                    self._metrics["progress_completion_block_shadowed"] += 1
+                comp_receipt = self._try_build_receipt_locked(
+                    state,
+                    stage="completion_gate",
+                    tool_call_id="completion-gate",
+                    guard_disposition="completion_shadow_blocked" if shadow_mode else "completion_blocked",
+                    decision="observe" if shadow_mode else "continue",
+                    outcome=outcome_tok,
+                    prereq_snap=prereq_snap,
+                    outputs_satisfied_override=not (no_relevant_attempt or no_relevant_persisted),
+                )
         if no_relevant_attempt or no_relevant_persisted or missing_verification:
             if no_relevant_attempt:
                 reason = "no task-relevant mutation was attempted"
@@ -2080,10 +2416,8 @@ class NervousSystem:
                 "reason": reason,
                 "shadow": self._config.mode == "shadow",
             })
+            self._log_receipt(comp_receipt)
             if self._config.mode == "shadow":
-                # Shadow mode observes only: record the would-be block, never steer the turn.
-                with self._lock:
-                    self._metrics["progress_completion_block_shadowed"] += 1
                 return None
             return {
                 "action": "continue",
@@ -2111,12 +2445,27 @@ class NervousSystem:
             },
         }
         self.emit_event(event)
-        if self._config.mode != "precommit":
-            return None
-        challenge = self.pop_challenge(turn_id=state.turn_id)
-        if challenge and challenge.get("jev_decision") not in {"DONE", "CONTINUE"}:
-            return {"action": "continue", "message": f"Jev completion challenge: {challenge.get('jev_decision')} ({challenge.get('confidence'):.3f}). Re-verify before finishing."}
-        return None
+        challenge_reply: dict[str, str] | None = None
+        if self._config.mode == "precommit":
+            challenge = self.pop_challenge(turn_id=state.turn_id)
+            if challenge and challenge.get("jev_decision") not in {"DONE", "CONTINUE"}:
+                challenge_reply = {
+                    "action": "continue",
+                    "message": f"Jev completion challenge: {challenge.get('jev_decision')} ({challenge.get('confidence'):.3f}). Re-verify before finishing.",
+                }
+        with self._lock:
+            done_receipt = self._try_build_receipt_locked(
+                state,
+                stage="completion_gate",
+                tool_call_id="completion-gate",
+                guard_disposition="completion_challenged" if challenge_reply is not None else "completion_allowed",
+                decision="continue" if challenge_reply is not None else "allow",
+                outcome="challenged" if challenge_reply is not None else "verified",
+                prereq_snap=prereq_snap,
+                outputs_satisfied_override=True,
+            )
+        self._log_receipt(done_receipt)
+        return challenge_reply
 
     def finish_turn(self, *, turn_id: str = "", session_id: str = "", assistant_response: str = "") -> None:
         state = self._resolve_turn(turn_id=turn_id, session_id=session_id)
@@ -2338,6 +2687,7 @@ class NervousSystem:
                 payload["recent_router"] = list(self._recent_router)[-limit:] if limit else []
                 payload["recent_challenges"] = list(self._recent_challenges)[-limit:] if limit else []
                 payload["recent_controls"] = list(self._recent_controls)[-limit:] if limit else []
+                payload["recent_accounting_receipts"] = list(self._recent_receipts)[-limit:] if limit else []
         if include_outcomes:
             payload["outcomes"] = self._outcomes.report()
         return payload
@@ -2429,3 +2779,31 @@ def status(turn_id: str = "", session_id: str = "") -> dict[str, Any]:
 
 def report(*, recent_limit: int = 5, include_recent: bool = False, include_outcomes: bool = False) -> dict[str, Any]:
     return _default.report(recent_limit=recent_limit, include_recent=include_recent, include_outcomes=include_outcomes)
+
+
+def accounting_receipts(
+    *,
+    session_id: str = "",
+    turn_id: str = "",
+    assignment_id: str = "",
+    limit: int = 128,
+) -> list[dict[str, Any]]:
+    return _default.accounting_receipts(
+        session_id=session_id,
+        turn_id=turn_id,
+        assignment_id=assignment_id,
+        limit=limit,
+    )
+
+
+def verify_accounting_receipt(
+    receipt: dict[str, Any],
+    *,
+    actor_session_id: str,
+    assignment_id: str,
+) -> bool:
+    return _default.verify_accounting_receipt(
+        receipt,
+        actor_session_id=actor_session_id,
+        assignment_id=assignment_id,
+    )
