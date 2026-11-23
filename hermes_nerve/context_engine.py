@@ -186,6 +186,11 @@ class NerveContextEngine(ContextEngine):
         self._shadow_curation_failures = 0
         self._last_failure_stage = ""
         self._last_failure_type = ""
+        self._unloaded = False
+
+    def deactivate(self) -> None:
+        """Disable Jev semantic curation on plugin unload so open sessions fall back cleanly."""
+        self._unloaded = True
 
     @property
     def name(self) -> str:
@@ -379,7 +384,7 @@ class NerveContextEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> list[dict[str, Any]]:
-        if self.mode == "shadow":
+        if getattr(self, "_unloaded", False) or self.mode == "shadow":
             return self._fallback_compress(messages, current_tokens, focus_topic, force, memory_context)
         if not isinstance(messages, list) or not messages:
             return messages
@@ -490,7 +495,7 @@ class NerveContextEngine(ContextEngine):
         return None
 
     def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None, **kwargs: Any) -> None:
-        if self.mode != "shadow" or not self.context_length:
+        if getattr(self, "_unloaded", False) or self.mode != "shadow" or not self.context_length:
             return None
         prompt = self.last_prompt_tokens
         if usage:

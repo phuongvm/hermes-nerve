@@ -442,6 +442,25 @@ class NervousSystem:
             if self._worker is worker and (worker is None or not worker.is_alive()):
                 self._worker = None
 
+    def shutdown(self) -> None:
+        """Disable live supervision, stop the worker, and release active turn/control state on plugin unload."""
+        self.configure(enabled=False, admission_enabled=False)
+        while True:
+            try:
+                self._tasks.get_nowait()
+                self._tasks.task_done()
+            except queue.Empty:
+                break
+        with self._lock:
+            for state in self._turns.values():
+                state.active_control = None
+                state.pending_challenges.clear()
+                state.pending_batch.clear()
+                state.assessment_inflight = False
+                state.finished = True
+            self._turns.clear()
+            self._session_turn.clear()
+
     def _enqueue_task(self, kind: str, payload: dict[str, Any]) -> bool:
         """Bound background work without ever blocking the serving hook."""
         try:
@@ -1246,6 +1265,8 @@ class NervousSystem:
         return {"accepted": True, "forwarded": True, "admission": admission, "router": route.as_dict()}
 
     def observe_tool_call(self, **kwargs: Any) -> dict[str, Any]:
+        if not self._config.enabled:
+            return {"accepted": False, "reason": "nervous-disabled"}
         tool_name = str(kwargs.get("tool_name") or "")
         status = str(kwargs.get("status") or "")
         raw_args = kwargs.get("args")
@@ -2348,6 +2369,8 @@ class NervousSystem:
         return None
 
     def inject_challenge(self, result: str, *, turn_id: str = "", session_id: str = "") -> str | None:
+        if not self._config.enabled:
+            return None
         challenge = self.pop_challenge(turn_id=turn_id, session_id=session_id)
         if challenge is None or self._config.mode == "shadow":
             return None
@@ -2384,6 +2407,8 @@ class NervousSystem:
         return str(result) + "\n\n<JEV_NERVOUS_SYSTEM>\n" + json.dumps(payload, sort_keys=True) + "\n</JEV_NERVOUS_SYSTEM>"
 
     def completion_gate(self, **kwargs: Any) -> dict[str, str] | None:
+        if not self._config.enabled:
+            return None
         state = self._resolve_turn(turn_id=str(kwargs.get("turn_id") or ""), session_id=str(kwargs.get("session_id") or ""))
         if state is None or state.admission not in {"ON", "WATCH"}:
             return None
@@ -2733,6 +2758,10 @@ _default = NervousSystem()
 
 def configure(**kwargs: Any) -> None:
     _default.configure(**kwargs)
+
+
+def shutdown() -> None:
+    _default.shutdown()
 
 
 def pre_llm_call(**kwargs: Any) -> str | None:

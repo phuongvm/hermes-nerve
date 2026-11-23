@@ -163,7 +163,7 @@ def request_context(*, request, settings, goal=None):
     return result
 
 
-def register_context_consumers(ctx, settings_getter):
+def register_context_consumers(ctx, settings_getter, *, is_active=None):
     """Install leased callbacks; Hermes unload/reload owns their lifetime.
 
     Resolve settings for EVERY invocation, not once per session; ON/OFF/SHADOW
@@ -179,6 +179,8 @@ def register_context_consumers(ctx, settings_getter):
         return (session, turn) if isinstance(session, str) and session and isinstance(turn, str) and turn else None
 
     def llm_request(*, request, **kwargs):
+        if is_active is not None and not is_active():
+            return None
         try:
             with goals_lock:
                 original_goal = goals.get(turn_key(kwargs))
@@ -192,6 +194,8 @@ def register_context_consumers(ctx, settings_getter):
         return None
 
     def memory_context(**kwargs):
+        if is_active is not None and not is_active():
+            return None
         try:
             # Ranking against the assembled user message lets injected memory
             # metadata drown the actual task. Capture the host's ORIGINAL

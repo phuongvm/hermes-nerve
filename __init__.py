@@ -1,6 +1,7 @@
 """Nerve plugin registration — profile-aware modular nervous system."""
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from pathlib import Path
@@ -147,7 +148,67 @@ def _nerve_hook_trace_sink(record):
         if str(__import__("os").getenv("NERVE_TRACE_DEBUG") or "") == "1":
             raise
 
+class _PluginLoadScope:
+    """Per-registration lifecycle guard: marks callbacks inert and tears down singletons on unload."""
+
+    def __init__(self, ctx) -> None:
+        self._active = True
+        self._engines: list = []
+        on_unload = getattr(ctx, "on_unload", None)
+        if callable(on_unload):
+            on_unload(self.teardown)
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def guard(self, fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if not self._active:
+                return None
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    def track_engine(self, engine):
+        self._engines.append(engine)
+        return engine
+
+    def teardown(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        for engine in self._engines:
+            deactivate = getattr(engine, "deactivate", None)
+            if callable(deactivate):
+                deactivate()
+        nervous.shutdown()
+        selective_context.configure(
+            enabled=False,
+            memory_mode="off",
+            tools_mode="off",
+            skills_mode="off",
+        )
+        gate.configure(mode="off")
+        work_runtime.set_tool_dispatcher(None)
+        work_runtime.configure(enabled=False)
+        assistant.configure(loops_enabled=False, audit_enabled=False)
+        experience.configure(enabled=False)
+        ledger.configure(enabled=False)
+        receipts.configure(enabled=False)
+        remote_runtime.configure(hosts={}, default_host="")
+        advisory.shutdown()
+        import sys as _sys
+
+        top_nervous = _sys.modules.get("hermes_nerve.nervous")
+        if top_nervous is not None and top_nervous is not nervous:
+            top_shutdown = getattr(top_nervous, "shutdown", None)
+            if callable(top_shutdown):
+                top_shutdown()
+
+
 def _register_legacy(ctx, policy):
+    load_scope = _PluginLoadScope(ctx)
     is_kanban_worker = bool(
         str(os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_TASK_ID") or "").strip()
     )
@@ -379,33 +440,33 @@ def _register_legacy(ctx, policy):
         advisory.shutdown()
         advisory.write_health_snapshot()
 
-    ctx.register_hook("pre_tool_call", _pre_tool_control)
+    ctx.register_hook("pre_tool_call", load_scope.guard(_pre_tool_control))
     ctx.register_hook("post_tool_call", work_hooks.post_tool_call)
     if not headless_worker:
         ctx.register_hook("post_tool_call", ledger.observe_tool_call)
         ctx.register_hook("post_tool_call", nervous.post_tool_call)
         ctx.register_hook("post_tool_call", gate.post_tool_call)
         ctx.register_hook("post_approval_response", gate.post_approval_response)
-    ctx.register_hook("pre_llm_call", _pre_llm)
-    ctx.register_hook("transform_tool_result", _transform_tool_result)
+    ctx.register_hook("pre_llm_call", load_scope.guard(_pre_llm))
+    ctx.register_hook("transform_tool_result", load_scope.guard(_transform_tool_result))
     if headless_worker:
         ctx.register_hook("pre_verify", work_hooks.pre_verify)
     else:
         _register_nervous_verify(ctx)
     ctx.register_hook("post_api_request", work_hooks.post_api_request)
     ctx.register_hook("api_request_error", work_hooks.api_request_error)
-    ctx.register_hook("post_llm_call", _post_llm)
-    ctx.register_hook("on_session_end", _session_end)
+    ctx.register_hook("post_llm_call", load_scope.guard(_post_llm))
+    ctx.register_hook("on_session_end", load_scope.guard(_session_end))
 
     if not headless_worker and bool(ctx.get_config("context_engine_register", True)) and hasattr(ctx, "register_context_engine"):
-        ctx.register_context_engine(nerve_context_engine.NerveContextEngine(
+        ctx.register_context_engine(load_scope.track_engine(nerve_context_engine.NerveContextEngine(
             mode=ctx.get_config("context_engine_mode", "shadow"),
             threshold_percent=ctx.get_config("context_engine_threshold_percent", 0.72),
             protect_first_n=ctx.get_config("context_engine_protect_first_n", 3),
             protect_last_n=ctx.get_config("context_engine_protect_last_n", 6),
             shadow_trigger_percent=ctx.get_config("context_engine_shadow_trigger_percent", 0.55),
             fallback_builtin=ctx.get_config("context_engine_fallback_builtin", True),
-        ))
+        )))
     logger.info(
         "Nerve %s loaded from %s; tools=%d headless_worker=%s work_supervision=%s",
         VERSION, Path(__file__).resolve().parent, 0 if headless_worker else len(registrations), headless_worker,
@@ -429,6 +490,7 @@ def _register_legacy(ctx, policy):
 
 
 def _register_profile(ctx):
+    load_scope= _PluginLoadScope(ctx)
     policy=resolve_config(ctx.get_config)
     get=policy.get_config
 
@@ -707,16 +769,24 @@ def _register_profile(ctx):
         advisory.shutdown()
         advisory.write_health_snapshot()
 
-    pre_tool_needed=policy.enabled("remote_workers") or policy.enabled("work_supervision") or (not headless_worker and (policy.enabled("nervous") or policy.enabled("action_gate")))
-    if pre_tool_needed:ctx.register_hook("pre_tool_call",_pre_tool_control)
-    if policy.enabled("work_supervision"):ctx.register_hook("post_tool_call",work_hooks.post_tool_call)
-    if not headless_worker and policy.enabled("context_governor"):ctx.register_hook("post_tool_call",ledger.observe_tool_call)
-    if not headless_worker and policy.enabled("nervous"):ctx.register_hook("post_tool_call",nervous.post_tool_call)
+    pre_tool_needed = (
+        policy.enabled("remote_workers")
+        or policy.enabled("work_supervision")
+        or (not headless_worker and (policy.enabled("nervous") or policy.enabled("action_gate")))
+    )
+    if pre_tool_needed:
+        ctx.register_hook("pre_tool_call", load_scope.guard(_pre_tool_control))
+    if policy.enabled("work_supervision"):
+        ctx.register_hook("post_tool_call", work_hooks.post_tool_call)
+    if not headless_worker and policy.enabled("context_governor"):
+        ctx.register_hook("post_tool_call", ledger.observe_tool_call)
+    if not headless_worker and policy.enabled("nervous"):
+        ctx.register_hook("post_tool_call", nervous.post_tool_call)
     if not headless_worker and policy.enabled("action_gate"):
         ctx.register_hook("post_tool_call", gate.post_tool_call)
         ctx.register_hook("post_approval_response", gate.post_approval_response)
     if policy.enabled("work_supervision") or (not headless_worker and (policy.enabled("nervous") or policy.enabled("assistant_loops"))):
-        ctx.register_hook("pre_llm_call",_pre_llm)
+        ctx.register_hook("pre_llm_call", load_scope.guard(_pre_llm))
     # Use Hermes' supported behavior-changing request middleware. Observer
     # hooks do not apply tool/skill selections, and pre_llm_call stringifies
     # structured context rather than selecting it on current Hermes hosts.
@@ -744,31 +814,31 @@ def _register_profile(ctx):
                 settings["selective_context_memory_mode"] = "off"
             return settings
 
-        register_context_consumers(ctx, _selective_settings)
+        register_context_consumers(ctx, _selective_settings, is_active=load_scope.is_active)
     if policy.enabled("work_supervision") or (not headless_worker and policy.enabled("nervous")):
-        ctx.register_hook("transform_tool_result",_transform_tool_result)
+        ctx.register_hook("transform_tool_result", load_scope.guard(_transform_tool_result))
     if headless_worker and policy.enabled("work_supervision"):
-        ctx.register_hook("pre_verify",work_hooks.pre_verify)
+        ctx.register_hook("pre_verify", work_hooks.pre_verify)
     elif not headless_worker and policy.enabled("nervous"):
         _register_nervous_verify(ctx)
     elif policy.enabled("work_supervision"):
-        ctx.register_hook("pre_verify",work_hooks.pre_verify)
+        ctx.register_hook("pre_verify", work_hooks.pre_verify)
     if policy.enabled("work_supervision"):
-        ctx.register_hook("post_api_request",work_hooks.post_api_request)
-        ctx.register_hook("api_request_error",work_hooks.api_request_error)
+        ctx.register_hook("post_api_request", work_hooks.post_api_request)
+        ctx.register_hook("api_request_error", work_hooks.api_request_error)
     if policy.enabled("work_supervision") or (not headless_worker and policy.enabled("nervous")):
-        ctx.register_hook("post_llm_call",_post_llm)
-        ctx.register_hook("on_session_end",_session_end)
+        ctx.register_hook("post_llm_call", load_scope.guard(_post_llm))
+        ctx.register_hook("on_session_end", load_scope.guard(_session_end))
 
     if not headless_worker and policy.enabled("context_governor") and bool(get("context_engine_register",True)) and hasattr(ctx,"register_context_engine"):
-        ctx.register_context_engine(nerve_context_engine.NerveContextEngine(
+        ctx.register_context_engine(load_scope.track_engine(nerve_context_engine.NerveContextEngine(
             mode=get("context_engine_mode","shadow"),
             threshold_percent=get("context_engine_threshold_percent",0.72),
             protect_first_n=get("context_engine_protect_first_n",3),
             protect_last_n=get("context_engine_protect_last_n",6),
             shadow_trigger_percent=get("context_engine_shadow_trigger_percent",0.55),
             fallback_builtin=get("context_engine_fallback_builtin",True),
-        ))
+        )))
 
     if policy.enabled("shared_context") and not headless_worker:
         try:
