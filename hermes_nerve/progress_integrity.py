@@ -490,9 +490,9 @@ def _python_test_command(segment: str) -> bool:
     if not argv:
         return False
     executable = PurePosixPath(argv[0]).name
-    if executable == "pytest":
+    if executable in {"pytest", "pytest.exe"}:
         return True
-    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable):
         return False
     args = argv[1:]
     while args and args[0] in {"-b", "-u", "-i", "-e", "-s", "-o", "-oo", "-q"}:
@@ -504,7 +504,7 @@ def _python_test_command(segment: str) -> bool:
 
 
 _ENV_ASSIGN_RE = re.compile(r"^(?:env\s+)?(?:[a-z_][a-z0-9_]*=\S*\s+)+")
-_PYTHON_PATH_RE = re.compile(r"^\S*/(?:bin/)?(python3?(?:\.\d+)?|pytest|py\.test)(?=\s|$)")
+_PYTHON_PATH_RE = re.compile(r"^\S*/(?:bin/|scripts/)?(python3?(?:\.\d+)?|pytest|py\.test)(?:\.exe)?(?=\s|$)")
 
 
 # Only known value-taking options may consume the next word. Treating every
@@ -568,6 +568,42 @@ def tool_kind(tool_name: str, args: dict[str, Any] | None = None) -> str:
             return "test"
 
     return ""
+
+
+_BOOT_SKILL_TOOLS = frozenset({
+    "skill_view", "skills_list", "tool_describe", "tool_search",
+})
+_BOOT_RULE_FILENAMES = frozenset({
+    "agents.md", "claude.md", "soul.md", "skill.md",
+    "lessons-digest.md", "startup-rules.md", "safety.md",
+})
+
+
+def is_boot_or_skill_overhead(tool_name: str, args: dict[str, Any] | None = None) -> bool:
+    """True for mandatory session-boot rule reads or skill/tool metadata lookups."""
+    selected = str(tool_name or "").strip().lower()
+    if ":" in selected:
+        selected = selected.split(":")[-1]
+    if selected in _BOOT_SKILL_TOOLS:
+        return True
+    if tool_kind(tool_name, args) != "read":
+        return False
+    raw_path = ""
+    if isinstance(args, dict):
+        for key in ("path", "file_path", "target_path", "filename"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                raw_path = val.strip()
+                break
+    if not raw_path:
+        return False
+    norm = raw_path.replace("\\", "/").lower()
+    basename = PurePosixPath(norm).name
+    if basename in _BOOT_RULE_FILENAMES:
+        return True
+    if norm.endswith(".md") and ("/rules/" in norm or norm.startswith("rules/")):
+        return True
+    return False
 
 
 def test_result_masked(command: str) -> bool:

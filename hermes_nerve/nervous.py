@@ -50,6 +50,7 @@ from .progress_integrity import (
     changed_paths_relevant,
     environment_action,
     environment_failure,
+    is_boot_or_skill_overhead,
     mutation_is_relevant,
     update_output_evidence,
     requested_paths as progress_requested_paths,
@@ -135,6 +136,8 @@ _DETERMINISTIC_FAILURE_MARKERS = (
 )
 _PROGRESS_CHALLENGE_AFTER = 12
 _PROGRESS_BLOCK_AFTER = 16
+_MAX_EXEMPT_BOOT_SKILL_ACTIONS = 16
+_MAX_BASELINE_TESTS_UNDER_STALL = 2
 
 
 def _deterministic_failure_reason(status: str, result: str, error_message: str) -> str:
@@ -268,6 +271,8 @@ class AssignmentProgress:
     relevant_mutation_attempts: int = 0
     successful_relevant_mutations: int = 0
     verified_test_passes: int = 0
+    baseline_test_runs: int = 0
+    exempt_boot_skill_fps: set[str] = field(default_factory=set)
     produced_outputs: set[str] = field(default_factory=set)
     observation_seq: int = 0
     admitted_prerequisite_calls: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_RETAINED_RECEIPTS))
@@ -1383,7 +1388,17 @@ class NervousSystem:
         if state is not None:
             prereq_snap = self._snapshot_prerequisite_capacity(state)
             with self._lock:
-                state.progress.tool_actions += 1
+                boot_skill_exempt = (
+                    not is_failure
+                    and is_boot_or_skill_overhead(tool_name, args)
+                    and bool(action_fp)
+                    and action_fp not in state.progress.exempt_boot_skill_fps
+                    and len(state.progress.exempt_boot_skill_fps) < _MAX_EXEMPT_BOOT_SKILL_ACTIONS
+                )
+                if boot_skill_exempt:
+                    state.progress.exempt_boot_skill_fps.add(action_fp)
+                else:
+                    state.progress.tool_actions += 1
                 kind = tool_kind(tool_name, args)
                 is_prereq = (
                     bool(raw_call_id and raw_call_id in state.progress.admitted_prerequisite_calls)
@@ -1713,6 +1728,14 @@ class NervousSystem:
                             "requested_paths": list(state.requested_paths),
                         })
                         guard_disp, dec, out_tok = "unrelated_mutation_under_stall", "allow", "allowed"
+                    elif (
+                        tool_kind(tool_name, args) == "test"
+                        and state.progress.mutation_attempts == 0
+                        and state.progress.baseline_test_runs < _MAX_BASELINE_TESTS_UNDER_STALL
+                        and not same_action
+                    ):
+                        state.progress.baseline_test_runs += 1
+                        guard_disp, dec, out_tok = "baseline_test_under_stall", "allow", "allowed"
                     else:
                         directive.attempted_overrides += 1
                         self._metrics["control_override_attempts"] += 1
