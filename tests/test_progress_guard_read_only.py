@@ -80,9 +80,43 @@ class ChangeRequiredReadOnlyTests(unittest.TestCase):
             "Check the logs after the fix was applied yesterday.",
             "Review the results after my patch landed.",
             "Diff the file against the earlier edit.",
+            "Verify tests/test_contract.py against the pre-edit baseline.",
         ):
             with self.subTest(message=message):
                 self.assertFalse(change_required(message))
+
+    def test_read_only_reviewer_delegation_with_hyphen_compounds_and_noun_changes(self):
+        """Regression tests from live @reviewer subagents blocked by pre-edit / change-against."""
+        spec_reviewer_prompt = (
+            "CONTEXT:\n"
+            "Sandbox O:/workspaces/_scratch/hermes_e2e_acceptance; "
+            "Run sha256sum tests/test_contract.py scripts/check_legacy_compat.py in sandbox; "
+            "pre-edit test hash 5892bbc249900b45aacda24c328bb8c255720c45b80b3ed03c273e89232dc322; "
+            "Read-only; no reports/files/external messages from child.\n\n"
+            "GOAL:\n"
+            "Read-only independent SPEC/diff acceptance review as @reviewer. "
+            "Verify final billing.py and retry_policy.py strictly against SPEC.md and hash "
+            "tests/test_contract.py against pre-edit baseline. Report APPROVE or REQUEST_CHANGES "
+            "with file:line evidence; do not fabricate or modify anything."
+        )
+        standards_reviewer_prompt = (
+            "CONTEXT:\n"
+            "Sandbox O:/workspaces/_scratch/hermes_e2e_acceptance; read README.md, SPEC.md and "
+            "final src/billing.py, src/retry_policy.py. Compare current changes with that "
+            "behavioral baseline for surgical scope. No changes, no network.\n\n"
+            "GOAL:\n"
+            "Read-only independent Standards axis: review isolated billing/retry change against "
+            "project docs and Fowler smells with cited findings; return APPROVE or REQUEST_CHANGES "
+            "separately from spec reviewer."
+        )
+        noun_adverb_prompt = (
+            "Read-only audit: inspect the recent patch carefully and verify post-patch logs "
+            "for regressions without modifying any file."
+        )
+        for prompt in (spec_reviewer_prompt, standards_reviewer_prompt, noun_adverb_prompt):
+            with self.subTest(prompt=prompt[:70]):
+                self.assertTrue(read_only_audit_message(prompt))
+                self.assertFalse(change_required(prompt))
 
 
 class ChangeRequiredImplementationTests(unittest.TestCase):

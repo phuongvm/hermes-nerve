@@ -262,13 +262,45 @@ READ_ONLY_MARKERS = (
     "no delegation",
 )
 
+# Hyphen-prefixed compound modifiers/nouns ("pre-edit baseline", "post-patch check",
+# "code-change diff", "bug-fix audit") are never imperative mutation commands.
+# Because "-" triggers \b, stripping them explicitly keeps read-only audits and
+# verification prompts from mistaking "pre-edit" for an imperative "edit".
+_HYPHEN_COMPOUND_CHANGE_RE = re.compile(
+    r"\b(?:pre|post|non|un|hot|bug|code|config|schema|spec|source|file|diff|line|state|api|ui)"
+    rf"-(?:{_CHANGE_WORDS})s?\b",
+    re.IGNORECASE,
+)
+
+# Non-target function words that follow a noun reading ("review billing/retry change
+# against project docs", "verify fix for regressions", "audit patch in staging")
+# rather than introducing a direct object of an imperative mutation verb.
+_NON_OBJECT_FOLLOWERS = (
+    "against|from|with|for|in|into|on|onto|of|at|by|as|to|before|after|during|"
+    "without|under|over|between|through|across|about|around|since|until|while|"
+    "when|where|if|then|than|which|who|and|or|nor|but|yet|so|"
+    "is|are|was|were|be|been|being|has|have|had|does|do|did|"
+    "will|would|should|could|may|might|must|can|not|no|only|never|already|still|just|also"
+)
+
+# Read-only inspection verbs followed by a noun-phrase change target without an
+# article ("review isolated billing/retry change", "audit recent config patch").
+# Conjunctions/clause boundaries are excluded so "review logs and fix bug" keeps "fix bug".
+_REVIEW_NOUN_CHANGE_RE = re.compile(
+    r"\b(?:review|audit|inspect|verify|compare|evaluate|assess|analyze|examine)\s+"
+    r"(?:(?!(?:and|or|nor|but|then|to|if|while|when|before|after)\b)[a-z0-9_./-]+\s+){0,3}?"
+    rf"(?:{_CHANGE_WORDS})s?\b",
+    re.IGNORECASE,
+)
+
 # Imperative mutation intent: the verb is the task, not a noun in prose.
 # "after the configuration update" (noun) must not match; "update the config" must.
-# "the configuration update" is a noun phrase, so it does not match: the regex
-# requires the verb to be followed by its object.
+# "pre-edit baseline" (hyphen compound) and "billing/retry change against docs"
+# (noun + preposition) must not match.
 IMPERATIVE_CHANGE_RE = re.compile(
-    rf"\b{_CHANGE_VERBS}\b"
+    rf"(?<![\w-]){_CHANGE_VERBS}\b"
     r"\s+(?:(?:a|an|the|this|that|these|those)\s+)?"
+    rf"(?!(?:{_NON_OBJECT_FOLLOWERS})\b)"
     r"[a-z0-9_./-]{2,}",
     re.IGNORECASE,
 )
@@ -278,7 +310,10 @@ IMPERATIVE_CHANGE_RE = re.compile(
 # Matching those as imperative work would defeat the whole exemption, so any
 # negated occurrence is stripped before the imperative test runs.
 _NEGATED_CHANGE_RE = re.compile(
-    r"(?:\bno\b|\bnot\b|\bwithout\b|\bnever\b|\bdon't\b|\bdo\s+not\b)"
+    r"(?:\bno\b|\bnot\b|\bwithout\b|\bnever\b"
+    r"|\bdon['\u2019]t\b|\bdo\s+not\b|\bcannot\b|\bcan['\u2019]t\b"
+    r"|\bmust\s+not\b|\bmustn['\u2019]t\b|\bshould\s+not\b|\bshouldn['\u2019]t\b"
+    r"|\bno\s+need\s+to\b|\bforbid\w*\s+(?:from|to)\b)"
     r"[^.;:!?\n]{0,40}?"
     rf"\b(?:{_CHANGE_WORDS}|restart|delegat\w*)\b",
     re.IGNORECASE,
@@ -316,6 +351,12 @@ def read_only_audit_message(user_message: str) -> bool:
     # Negated change verbs ("do not modify", "no configuration changes") are
     # prohibitions, not instructions, so they must not disqualify the exemption.
     residual = _NEGATED_CHANGE_RE.sub(" ", text)
+    # Replace determiner-noun phrases ("the fix", "a patch") with a neutral noun
+    # placeholder so preceding real imperatives ("implement the fix") retain an
+    # object while bare noun references ("verify the recent patch carefully") do not.
+    residual = _NOUN_CHANGE_RE.sub(" item ", residual)
+    residual = _REVIEW_NOUN_CHANGE_RE.sub(" review item ", residual)
+    residual = _HYPHEN_COMPOUND_CHANGE_RE.sub(" ", residual)
     if IMPERATIVE_CHANGE_RE.search(residual):
         return False
     return True
@@ -335,11 +376,12 @@ def change_required(user_message: str) -> bool:
     msg = _unquoted_intent(msg).strip()
     if not msg:
         return False
-    # Strip negated change phrases ("do not fix", "never implement") and
-    # determiner-noun readings ("the update", "a fix") before testing for a
-    # change verb, so prose that merely mentions an update is not mistaken for
-    # an instruction to make one.
+    # Strip negated change phrases ("do not fix", "never implement"), hyphenated
+    # compound modifiers ("pre-edit baseline"), and determiner-noun readings
+    # ("the update", "a fix") before testing for a change verb, so prose that
+    # merely mentions an update is not mistaken for an instruction to make one.
     msg = NEGATED_CHANGE_RE.sub(" ", msg)
+    msg = _HYPHEN_COMPOUND_CHANGE_RE.sub(" ", msg)
     msg = _NOUN_CHANGE_RE.sub(" ", msg)
     return bool(CHANGE_REQUIRED_RE.search(NEGATED_CHANGE_RE.sub(" ", msg)))
 
