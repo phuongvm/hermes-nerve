@@ -98,11 +98,17 @@ HARNESS_INSTRUCTIONS_NAMES = frozenset({"agents.md", "instructions.md"})
 # never a file the turn is asked to change.
 CAMEL_CASE_SEGMENT_RE = re.compile(r"^[a-z0-9]+[A-Z]")
 
+_BOARD_MUTATION_TOOLS = frozenset({
+    "kanban_create", "kanban_link", "kanban_complete",
+    "crew_card_create", "crew_plan", "crew_plan_split", "crew_review_handoff",
+})
+
 TOOL_ALIASES: dict[str, frozenset[str]] = {
     "mutation": frozenset({
         "write_file", "edit_file", "patch", "patch_file", "apply_patch", "replace_file",
         "create_file", "delete_file", "move_file", "rename_file", "fs_write", "fs_replace",
         "write", "edit", "kanban_create", "kanban_link", "kanban_complete",
+        "crew_card_create", "crew_plan", "crew_plan_split", "crew_review_handoff",
     }),
     "read": frozenset({"read_file", "fs_read", "cat", "open_file"}),
     "search": frozenset({"search_text", "fs_search", "grep", "find", "list_files", "fs_list"}),
@@ -142,7 +148,7 @@ SCRATCH_NAMES = {
 }
 
 INTAKE_INVOCATION_RE = re.compile(
-    r'(?:\[IMPORTANT: The user has invoked the "(?:crew|crew-no-spec)" skill\b|^\s*/crew(?:-no-spec)?\b)',
+    r'(?:\[IMPORTANT: The user has invoked the "(?:crew|crew-no-spec|crew-diagnose)" skill\b|^\s*/crew(?:-no-spec|-diagnose)?\b)',
     re.IGNORECASE,
 )
 
@@ -316,7 +322,7 @@ def read_only_audit_message(user_message: str) -> bool:
 
 
 def change_required(user_message: str) -> bool:
-    msg = _unquoted_intent(str(user_message or "")).strip()
+    msg = str(user_message or "").strip()
     if INTAKE_INVOCATION_RE.search(msg) or SYSTEM_DELIVERY_RE.search(msg):
         return False
     if harness_instructions_message(msg) or read_only_audit_message(msg):
@@ -325,6 +331,9 @@ def change_required(user_message: str) -> bool:
     if not msg or INTAKE_INVOCATION_RE.search(msg) or SYSTEM_DELIVERY_RE.search(msg):
         return False
     if harness_instructions_message(msg) or read_only_audit_message(msg):
+        return False
+    msg = _unquoted_intent(msg).strip()
+    if not msg:
         return False
     # Strip negated change phrases ("do not fix", "never implement") and
     # determiner-noun readings ("the update", "a fix") before testing for a
@@ -685,6 +694,8 @@ def update_output_evidence(produced: set[str], required: tuple[str, ...], tool_n
     from the old side of a rename or a deleted path in a multi-file patch.
     """
     name = tool_name.strip().lower().rsplit(":", 1)[-1]
+    if name in _BOARD_MUTATION_TOOLS:
+        return
     touched = mutation_paths(tool_name, args)
     produced.difference_update(target for target in required if not touched or changed_paths_relevant(touched, (target,)))
     if name in {"move_file", "rename_file"}:

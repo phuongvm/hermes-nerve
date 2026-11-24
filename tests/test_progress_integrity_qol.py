@@ -11,6 +11,7 @@ from hermes_nerve.progress_integrity import (
     mutation_is_relevant,
     requested_paths,
     tool_kind,
+    update_output_evidence,
 )
 from tests.test_nervous import ScriptedEngine
 
@@ -127,6 +128,52 @@ class ProgressIntegrityQolTests(unittest.TestCase):
         self.assertTrue(change_required(interactive_skill_coding))
         self.assertTrue(verification_required(interactive_skill_coding))
         self.assertEqual(requested_paths(interactive_skill_coding), ("src/parser.py",))
+
+    def test_crew_intake_envelopes_and_crew_mutation_tools(self):
+        for skill_name, user_instruction in (
+            ("crew-no-spec", "let fix this issue"),
+            ("crew", "Fix src/parser.py and implement regression tests"),
+            ("crew-diagnose", "patch hermes_nerve/progress_integrity.py and fix the bug"),
+        ):
+            envelope = (
+                f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]\n\n'
+                'Orchestrate multi-role work: create cards, implement fixes, and verify proofs.\n\n'
+                f'The user has provided the following instruction alongside the skill invocation: {user_instruction}'
+            )
+            with self.subTest(skill_name=skill_name):
+                self.assertFalse(change_required(envelope))
+
+        for slash_cmd in (
+            "/crew fix X",
+            "/crew-no-spec fix X",
+            "/crew-diagnose fix X",
+            "  /crew-no-spec let fix this issue",
+        ):
+            with self.subTest(slash_cmd=slash_cmd):
+                self.assertFalse(change_required(slash_cmd))
+
+        for quoted_non_path in (
+            'Check logs for "fix failed"',
+            "Inspect status after 'implement retry' warning",
+        ):
+            with self.subTest(quoted_non_path=quoted_non_path):
+                self.assertFalse(change_required(quoted_non_path))
+
+        self.assertTrue(change_required("let fix this issue"))
+
+        for crew_tool in (
+            "crew_card_create",
+            "crew_plan",
+            "crew_plan_split",
+            "crew_review_handoff",
+            "default_api:crew_card_create",
+        ):
+            with self.subTest(crew_tool=crew_tool):
+                self.assertEqual(tool_kind(crew_tool, {}), "mutation")
+
+        produced = {"proposal.md"}
+        update_output_evidence(produced, ("proposal.md",), "crew_review_handoff", {"card_id": "c1"})
+        self.assertEqual(produced, {"proposal.md"})
 
     def test_bare_python_version_ranges_are_not_file_targets(self):
         targets = requested_paths(
