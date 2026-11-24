@@ -18,11 +18,12 @@ class Accept:
     receipt_id = "local"
 
 
-def _bound(tmp: str, *, target: int = 1_000_000):
+def _bound(tmp: str, *, target: int = 1_000_000, reviewer: str = "reviewer"):
     runtime.configure(
         enabled=True,
         mode="advisory",
         store_path=str(Path(tmp) / "work.db"),
+        reviewer=reviewer,
         provider_decisions_enabled=False,
         nerve_observer_enabled=True,
         nerve_auto_kill=False,
@@ -240,3 +241,26 @@ def test_post_verified_provider_call_prefers_controller_completion_over_kill():
             assert (control["payload"] or {}).get("lifecycle_state") == "COMPLETED"
         finally:
             runtime.set_tool_dispatcher(None)
+
+
+def test_review_handoff_without_distinct_reviewer_falls_back_to_kanban_block():
+    for configured_reviewer in ("", "coder", "@Coder"):
+        with tempfile.TemporaryDirectory() as td:
+            sup, ident = _bound(td, reviewer=configured_reviewer)
+            sup.engine_factory = lambda: ForecastEngine("MAYBE", 0.72)
+            calls = []
+            runtime.set_tool_dispatcher(lambda name, args: calls.append((name, args)) or '{"ok": true, "status": "blocked"}')
+            try:
+                env = {**_env(ident), "HERMES_PROFILE": "coder"}
+                with patch.dict(os.environ, env, clear=False):
+                    hooks.post_api_request(
+                        task_id="t", session_id="s", api_request_id="m",
+                        usage={"input_tokens": 810_000, "output_tokens": 0},
+                    )
+                assert [name for name, _ in calls] == ["kanban_block"]
+                _, block_args = calls[0]
+                assert block_args["task_id"] == "t"
+                assert block_args["kind"] == "needs_input"
+                assert set(block_args.keys()) <= {"task_id", "kind", "reason"}
+            finally:
+                runtime.set_tool_dispatcher(None)

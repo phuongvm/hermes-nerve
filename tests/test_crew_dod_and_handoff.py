@@ -394,6 +394,194 @@ class CrewDoDAndHandoffTests(unittest.TestCase):
             self.assertEqual(res["preserved_counts"], {"contracts": 1, "run_bindings": 1, "run_controls": 1})
             self.assertTrue(Path(res["backup_path"]).is_file())
 
+    def test_autobind_honors_explicit_crew_budget_without_undercutting(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "workspace"
+            ws.mkdir()
+            self._configure_store(root)
+
+            body = (
+                "Role: worker\n"
+                "Coordinator: default\n"
+                "Verify: dual\n"
+                "Budget: 1500000 tokens\n\n"
+                "GOAL: Fix Nerve budget watchdog self-review loop\n\n"
+                "Done when: (1) Explicit card budget is honored; (2) Missing reviewer blocks instead of looping\n"
+                "Units: hermes_nerve/work/autobind.py | hermes_nerve/work/hooks.py\n"
+                "Artifact: tests/test_crew_dod_and_handoff.py\n"
+                "proof command: `pytest -q`\n"
+            )
+            task_obj = SimpleNamespace(
+                id="t_d41b8068",
+                title="Crew high-budget card",
+                body=body,
+                current_run_id=1,
+                claim_lock="claim-1",
+            )
+            env = {
+                "HERMES_KANBAN_TASK_ID": "t_d41b8068",
+                "HERMES_KANBAN_RUN_ID": "1",
+                "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+                "HERMES_KANBAN_WORKSPACE": str(ws),
+                "HERMES_PROFILE": "coder",
+            }
+            with patch.dict(os.environ, env, clear=False), patch.object(
+                autobind, "_load_canonical_task", side_effect=lambda tid: task_obj if tid == "t_d41b8068" else None
+            ):
+                ident = autobind.ensure_kanban_binding(runtime.supervisor(), task_id="t_d41b8068", session_id="s-budget")
+                self.assertIsNotNone(ident)
+                contract = runtime.supervisor().active_contract("t_d41b8068")
+                assert contract is not None
+                self.assertGreaterEqual(contract.allocated_tokens, 1_500_000)
+                self.assertEqual(contract.allocated_tokens, 1_500_000)
+                budget_crit = next(c for c in contract.criteria if c.id == "DOD-BUDGET")
+                self.assertIn("1500000", budget_crit.description)
+
+        parse_budget = getattr(autobind, "parse_crew_budget_tokens", None)
+        self.assertIsNotNone(parse_budget, "parse_crew_budget_tokens helper must exist")
+        assert callable(parse_budget)
+        self.assertEqual(parse_budget("Budget: 1500000"), 1_500_000)
+        self.assertEqual(parse_budget("Budget: 1,500,000 tokens"), 1_500_000)
+        self.assertEqual(parse_budget("- **Budget**: `1500k`"), 1_500_000)
+        self.assertEqual(parse_budget("Budget: 1.5m"), 1_500_000)
+        self.assertEqual(parse_budget("Budget: 2.25M tokens (extended)"), 2_250_000)
+        for invalid in ("", "Role: worker", "Budget: 0", "Budget: -1000", "Budget: none", "Budget: $15", "Budget: 1500xyz"):
+            self.assertIsNone(parse_budget(invalid), invalid)
+
+        # Safety cap prevents runaway typos while allowing multi-million explicit Crew budgets
+        with tempfile.TemporaryDirectory() as td_cap:
+            root_cap = Path(td_cap)
+            ws_cap = root_cap / "workspace"
+            ws_cap.mkdir()
+            self._configure_store(root_cap)
+            huge_task = SimpleNamespace(
+                id="t_99999999",
+                title="Huge explicit budget card",
+                body="Role: worker\nBudget: 50m\nDone when: (1) Ship\nproof command: `pytest -q`\n",
+                current_run_id=1,
+                claim_lock="claim-cap",
+            )
+            env_cap = {
+                "HERMES_KANBAN_TASK_ID": "t_99999999",
+                "HERMES_KANBAN_RUN_ID": "1",
+                "HERMES_KANBAN_CLAIM_LOCK": "claim-cap",
+                "HERMES_KANBAN_WORKSPACE": str(ws_cap),
+                "HERMES_PROFILE": "coder",
+            }
+            with patch.dict(os.environ, env_cap, clear=False), patch.object(
+                autobind, "_load_canonical_task", side_effect=lambda tid: huge_task if tid == "t_99999999" else None
+            ):
+                autobind.ensure_kanban_binding(runtime.supervisor(), task_id="t_99999999", session_id="s-cap")
+                capped = runtime.supervisor().active_contract("t_99999999")
+                assert capped is not None
+                self.assertEqual(capped.allocated_tokens, 10_000_000)
+
+    def test_nerve_review_handoff_blocks_when_reviewer_missing_or_matches_worker_profile(self):
+        class _MaybeForecastEngine:
+            def assess(self, *, state, questions, contract):
+                return {
+                    "id": "forecast-maybe",
+                    "answers": {
+                        "finish_with_extension": {
+                            "type": "choice",
+                            "choice": "MAYBE",
+                            "probabilities": {"YES": 0.1, "NO": 0.2, "MAYBE": 0.7},
+                            "confidence": 0.7,
+                        }
+                    },
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                }
+
+        body = (
+            "Role: worker\n"
+            "Verify: dual\n"
+            "Budget: 1000000 tokens\n"
+            "Done when: (1) Implement fix\n"
+            "proof command: `pytest -q`\n"
+        )
+
+        for case_label, configured_rev, worker_prof, expect_tool in (
+            ("empty_reviewer", "", "coder", "kanban_block"),
+            ("same_profile", "coder", "coder", "kanban_block"),
+            ("same_profile_at_case", "@Coder", "coder", "kanban_block"),
+            ("distinct_reviewer", "reviewer", "coder", "kanban_request_review"),
+        ):
+            with self.subTest(case=case_label), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                ws = root / "workspace"
+                ws.mkdir()
+                db_path = root / "work-supervision.sqlite3"
+                runtime.configure(
+                    enabled=True,
+                    mode="advisory",
+                    store_path=str(db_path),
+                    reviewer=configured_rev,
+                    provider_decisions_enabled=False,
+                    nerve_observer_enabled=True,
+                    nerve_forecast_fraction=0.80,
+                )
+                task_obj = SimpleNamespace(
+                    id="t_d41b8068",
+                    title=f"Loop guard {case_label}",
+                    body=body,
+                    current_run_id=2,
+                    claim_lock="claim-2",
+                )
+                env = {
+                    "HERMES_KANBAN_TASK": "t_d41b8068",
+                    "HERMES_KANBAN_TASK_ID": "t_d41b8068",
+                    "HERMES_KANBAN_RUN_ID": "2",
+                    "HERMES_KANBAN_CLAIM_LOCK": "claim-2",
+                    "HERMES_KANBAN_WORKSPACE": str(ws),
+                    "HERMES_PROFILE": worker_prof,
+                }
+                dispatched: list[tuple[str, dict]] = []
+
+                def _reentrant_dispatch(name: str, args: dict):
+                    # Real Hermes PluginContext.dispatch_tool re-enters pre_tool_call hooks.
+                    gate_res = hooks.pre_tool_call(name, args, task_id="t_d41b8068", session_id="s-loop")
+                    self.assertIsNone(gate_res, f"Controller dispatch {name} must not be bounced by pre_tool_call: {gate_res}")
+                    dispatched.append((name, dict(args)))
+                    return json.dumps({"ok": True, "task_id": "t_d41b8068", "status": "blocked" if name == "kanban_block" else "review"})
+
+                runtime.set_tool_dispatcher(_reentrant_dispatch)
+                try:
+                    with patch.dict(os.environ, env, clear=False), patch.object(
+                        autobind, "_load_canonical_task", side_effect=lambda tid: task_obj if tid == "t_d41b8068" else None
+                    ):
+                        ident = hooks.bootstrap_kanban_worker(task_id="t_d41b8068", session_id="s-loop")
+                        assert ident is not None
+                        sup = runtime.supervisor()
+                        sup.engine_factory = _MaybeForecastEngine
+
+                        hooks.post_api_request(
+                            task_id="t_d41b8068",
+                            session_id="s-loop",
+                            api_request_id="req-85pct",
+                            usage={"input_tokens": 850_000, "output_tokens": 0},
+                        )
+
+                    self.assertEqual([name for name, _ in dispatched], [expect_tool])
+                    _, call_args = dispatched[0]
+                    if expect_tool == "kanban_block":
+                        self.assertEqual(call_args.get("task_id"), "t_d41b8068")
+                        self.assertEqual(call_args.get("kind"), "needs_input")
+                        self.assertTrue(str(call_args.get("reason") or "").strip())
+                        # Verify exact kanban_block schema compliance (no unknown keys like summary/metadata)
+                        self.assertTrue(set(call_args.keys()).issubset({"task_id", "kind", "reason"}))
+                    else:
+                        self.assertEqual(call_args.get("task_id"), "t_d41b8068")
+                        self.assertEqual(call_args.get("reviewer"), "reviewer")
+
+                    diag = sup.store.latest_diagnostic(
+                        task_id="t_d41b8068", run_id=2, kind="nerve_orchestrator_handoff"
+                    )
+                    self.assertIsNotNone(diag)
+                    self.assertTrue((diag["payload"] or {}).get("ok"))
+                finally:
+                    runtime.set_tool_dispatcher(None)
+
 
 if __name__ == "__main__":
     unittest.main()

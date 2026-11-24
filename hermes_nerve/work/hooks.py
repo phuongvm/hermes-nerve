@@ -574,9 +574,12 @@ def pre_tool_call(tool_name: str, args: dict, task_id: str | None = None, sessio
     name = str(tool_name or "")
 
     # A controller-owned dispatch re-enters Hermes' normal tool pipeline. Let
-    # that exact recursive kanban_complete / crew_review_handoff invocation through;
-    # all model-originated lifecycle attempts remain fenced below.
-    if name in {"kanban_complete", "crew_review_handoff"} and bool(_CONTROLLER_COMPLETION_DISPATCH.get()):
+    # that exact recursive lifecycle invocation through; all model-originated
+    # lifecycle attempts remain fenced below.
+    if (
+        name in {"kanban_complete", "crew_review_handoff", "kanban_request_review", "kanban_block"}
+        and bool(_CONTROLLER_COMPLETION_DISPATCH.get())
+    ):
         return None
 
     try:
@@ -943,7 +946,9 @@ def _nerve_review_handoff(sup, identity, decision, *, forecast: dict[str, Any] |
     """Return irreversible budget authority to Hermes' reviewer/orchestrator lane.
 
     Nerve may pause/handoff spending, but it never marks the task failed for economic
-    reasons. The reviewer/orchestrator owns the final COMPLETE / CHANGES / BLOCK call.
+    reasons. When no distinct reviewer profile is configured (empty or equal to the
+    active worker profile), fall back to ``kanban_block`` with ``kind='needs_input'``
+    so the same worker cannot self-claim its own ``review`` card in an infinite loop.
     """
     from .models import utc_now
     payload = {
@@ -968,34 +973,77 @@ def _nerve_review_handoff(sup, identity, decision, *, forecast: dict[str, Any] |
     )
 
     if tool_dispatcher_available():
-        args: dict[str, Any] = {
-            "task_id": identity.task_id,
-            "summary": (
-                "Nerve budget watchdog is returning this run to orchestrator review before any stop decision. "
-                + decision.reason
-            )[:1000],
-            "metadata": {
-                "source": "nerve_observer",
-                "orchestrator_review_required": True,
-                "nerve": decision.as_dict(),
-                "forecast": dict(forecast or {}),
-            },
-        }
         configured_reviewer = str(reviewer() or "").strip()
-        if configured_reviewer:
-            args["reviewer"] = configured_reviewer
+        current_profile = str(os.getenv("HERMES_PROFILE") or "").strip()
+        has_distinct_reviewer = bool(configured_reviewer) and (
+            configured_reviewer.lower().lstrip("@") != current_profile.lower().lstrip("@")
+        )
+        if has_distinct_reviewer:
+            dispatched_tool = "kanban_request_review"
+            args: dict[str, Any] = {
+                "task_id": identity.task_id,
+                "reviewer": configured_reviewer,
+                "summary": (
+                    "Nerve budget watchdog is returning this run to orchestrator review before any stop decision. "
+                    + decision.reason
+                )[:1000],
+                "metadata": {
+                    "source": "nerve_observer",
+                    "orchestrator_review_required": True,
+                    "nerve": decision.as_dict(),
+                    "forecast": dict(forecast or {}),
+                },
+            }
+        else:
+            dispatched_tool = "kanban_block"
+            fallback_detail = (
+                f"configured reviewer {configured_reviewer!r} matches worker profile {current_profile!r}"
+                if configured_reviewer
+                else "no distinct reviewer profile is configured"
+            )
+            args = {
+                "task_id": identity.task_id,
+                "kind": "needs_input",
+                "reason": (
+                    f"Nerve budget watchdog paused this run for orchestrator input ({fallback_detail}; "
+                    "avoiding self-review reclaim loop). "
+                    + decision.reason
+                )[:1000],
+            }
+        token = _CONTROLLER_COMPLETION_DISPATCH.set(True)
         try:
-            native = dispatch_tool("kanban_request_review", args)
+            native = dispatch_tool(dispatched_tool, args)
             ok, text = _native_dispatch_succeeded(native)
             sup.store.add_diagnostic(
-                task_id=identity.task_id, run_id=identity.run_id, kind="nerve_orchestrator_handoff",
-                payload={"ok": bool(ok), "result": str(text)[:1200], **payload}, created_at=utc_now(),
+                task_id=identity.task_id,
+                run_id=identity.run_id,
+                kind="nerve_orchestrator_handoff",
+                payload={
+                    "ok": bool(ok),
+                    "tool": dispatched_tool,
+                    "configured_reviewer": configured_reviewer,
+                    "worker_profile": current_profile,
+                    "result": str(text)[:1200],
+                    **payload,
+                },
+                created_at=utc_now(),
             )
         except Exception as exc:
             sup.store.add_diagnostic(
-                task_id=identity.task_id, run_id=identity.run_id, kind="nerve_orchestrator_handoff_failed",
-                payload={"error": f"{type(exc).__name__}: {exc}", **payload}, created_at=utc_now(),
+                task_id=identity.task_id,
+                run_id=identity.run_id,
+                kind="nerve_orchestrator_handoff_failed",
+                payload={
+                    "tool": dispatched_tool,
+                    "configured_reviewer": configured_reviewer,
+                    "worker_profile": current_profile,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    **payload,
+                },
+                created_at=utc_now(),
             )
+        finally:
+            _CONTROLLER_COMPLETION_DISPATCH.reset(token)
     return payload
 
 

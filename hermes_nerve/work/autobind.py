@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -17,9 +18,14 @@ _ANY_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+?)\s*$")
 _CANONICAL_TASK_ID_RE = re.compile(r"^t_[0-9a-f]{6,}$", re.I)
 _CREW_FIELD_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?\**(Role|Verify|Done\s+when|Units|Artifact|proof\s+command)\**\s*:\s*(.+?)\s*$",
+    r"^\s*(?:[-*+]\s+)?\**(Role|Verify|Budget|Done\s+when|Units|Artifact|proof\s+command)\**\s*:\**\s*(.+?)\s*$",
     re.I,
 )
+_CREW_BUDGET_RE = re.compile(
+    r"^([+-]?\d[\d,_]*(?:\.\d+)?)\s*([km])?\b(?:\s*tokens?)?(?:\s*\(.*\))?\s*$",
+    re.I,
+)
+_EXPLICIT_TASK_BUDGET_MAX_TOKENS = 10_000_000
 _NUMBERED_CLAUSE_SPLIT_RE = re.compile(r"(?:^|\s+)\(\d+\)\s+")
 _WRITER_PROFILES = {"coder", "designer", "worker", "content", "researcher", "leader"}
 _CLOSER_PROFILES = {"reviewer", "qa", "verifier"}
@@ -55,6 +61,30 @@ def parse_crew_contract_fields(body: str) -> dict[str, str]:
         if val:
             fields[key] = val
     return fields
+
+
+def parse_crew_budget_tokens(body: str) -> int | None:
+    """Parse an explicit Crew ``Budget:`` token ceiling when positive and well-formed."""
+    fields = parse_crew_contract_fields(body)
+    raw = str(fields.get("budget") or "").strip().strip("`\"'").strip("*_").strip()
+    if not raw or raw.lower() in {"none", "n/a", "-"} or "$" in raw or "usd" in raw.lower():
+        return None
+    m = _CREW_BUDGET_RE.match(raw)
+    if not m:
+        return None
+    num_text = m.group(1).replace(",", "").replace("_", "")
+    suffix = (m.group(2) or "").lower()
+    try:
+        value = float(num_text)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    if not suffix and not value.is_integer():
+        return None
+    multiplier = 1_000 if suffix == "k" else 1_000_000 if suffix == "m" else 1
+    tokens = int(round(value * multiplier))
+    return tokens if tokens > 0 else None
 
 
 def infer_run_terminal_mode(body: str, worker_profile: str | None = None) -> str:
@@ -342,6 +372,13 @@ def ensure_kanban_binding(supervisor, *, task_id: str = "", session_id: str = ""
             )
         else:
             task_budget = int(cfg.get("default_task_budget_tokens", 70000))
+        explicit_budget = parse_crew_budget_tokens(body)
+        if explicit_budget is not None and explicit_budget > task_budget:
+            explicit_cap = max(
+                int(cfg.get("budget_estimator_max_tokens", 2000000)),
+                int(cfg.get("explicit_task_budget_max_tokens", _EXPLICIT_TASK_BUDGET_MAX_TOKENS)),
+            )
+            task_budget = min(explicit_budget, explicit_cap)
         criteria, reserve = build_criteria(body, total_budget=task_budget)
         if criteria and bool(cfg.get("budget_dod_required", True)):
             criteria.append(budget_criterion(task_budget, tolerance=float(cfg.get("budget_dod_tolerance", 1.10))))
