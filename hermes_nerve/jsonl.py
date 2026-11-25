@@ -59,6 +59,54 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> Path:
     return selected
 
 
+def append_jsonl_many(
+    path: Path,
+    records: list[dict[str, Any]],
+    *,
+    must_exist: bool = False,
+    require_parent: bool = False,
+) -> Path:
+    selected = Path(path).expanduser()
+    if not records:
+        return selected
+    if must_exist:
+        flags = os.O_APPEND | os.O_WRONLY
+    else:
+        if require_parent and not selected.parent.is_dir():
+            return selected
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    payload = "".join(
+        json.dumps(record, sort_keys=True, ensure_ascii=False, default=str) + "\n"
+        for record in records
+    ).encode("utf-8")
+    lock = _lock_for(selected)
+    with lock:
+        try:
+            fd = os.open(str(selected), flags, 0o600)
+        except FileNotFoundError:
+            if must_exist or require_parent:
+                return selected
+            raise
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short JSONL append")
+                view = view[written:]
+        finally:
+            if _fcntl is not None:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+    return selected
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     selected = Path(path).expanduser()
     lock = _lock_for(selected)

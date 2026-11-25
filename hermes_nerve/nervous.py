@@ -14,6 +14,7 @@ action from running indefinitely even if remote supervision arrives late.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import math
@@ -39,7 +40,11 @@ from .accounting_receipts import (
 )
 from .engine import DecisionEngine
 from . import experience
-from .jsonl import append_jsonl
+from . import jsonl as _jsonl_mod
+from .jsonl import append_jsonl, append_jsonl_many, read_jsonl
+
+_STOCK_EXPERIENCE_DEFAULT_STORE = experience.default_store
+_STOCK_APPEND_JSONL = append_jsonl
 from .outcomes import HistoricalOutcomeModel, OutcomeStore
 from .paths import hermes_home
 from .privacy import canonical_hash, redact
@@ -155,6 +160,28 @@ def _deterministic_failure_reason(status: str, result: str, error_message: str) 
 
 
 _PREREQUISITE_CONFIG = (("prerequisite_max_operations", 128), ("prerequisite_max_seconds", 900))
+DEFAULT_IO_QUEUE_MAXSIZE = 64
+_MAX_ABANDONED_IO_WORKERS = 2
+_IO_STOP = object()
+
+
+@dataclass(frozen=True)
+class _DeferredJsonl:
+    path: Path
+    record: dict[str, Any]
+    error_metric: str
+    must_exist: bool = False
+    require_parent: bool = False
+
+
+def _default_io_queue_maxsize() -> int:
+    raw = os.getenv("HERMES_NERVE_IO_QUEUE_MAXSIZE", "").strip()
+    if raw:
+        try:
+            return max(1, min(4096, int(raw)))
+        except ValueError:
+            pass
+    return DEFAULT_IO_QUEUE_MAXSIZE
 
 
 def _valid_prerequisite_limit(value: Any, maximum: int) -> bool:
@@ -181,6 +208,7 @@ class NervousConfig:
     policy_memory_enabled: bool = True
     policy_memory_ttl_seconds: int = 3600
     policy_memory_path: str = ""
+    io_queue_maxsize: int = field(default_factory=_default_io_queue_maxsize)
 
 
 @dataclass
@@ -332,11 +360,21 @@ class NervousSystem:
         self._tasks: queue.Queue[tuple[str, dict[str, Any], contextvars.Context]] = queue.Queue(maxsize=128)
         self._worker: threading.Thread | None = None
         self._stopping = False
+        self._io_cond = threading.Condition(threading.Lock())
+        self._io_queue: queue.Queue[Any] = queue.Queue(maxsize=self._config.io_queue_maxsize)
+        self._io_pending: int = 0
+        self._io_worker: threading.Thread | None = None
+        self._io_stop_event = threading.Event()
+        self._abandoned_io_workers: list[threading.Thread] = []
+        self._io_tls = threading.local()
         self._metrics: Counter[str] = Counter()
         self._recent_router: deque[dict[str, Any]] = deque(maxlen=50)
         self._recent_challenges: deque[dict[str, Any]] = deque(maxlen=30)
         self._recent_controls: deque[dict[str, Any]] = deque(maxlen=30)
         self._outcomes = OutcomeStore()
+        self._outcome_cache: list[dict[str, Any]] | None = None
+        self._outcome_cache_warming = False
+        self._initialized_paths: set[Path] = set()
         self._historical_model = HistoricalOutcomeModel(self._outcomes, self._config.local_learning_min_samples)
         self._policy_memory: PolicyMemory | None = None
 
@@ -415,6 +453,18 @@ class NervousSystem:
                     pass
             if "policy_memory_path" in kwargs:
                 cfg.policy_memory_path = str(kwargs["policy_memory_path"] or "").strip()
+            if "io_queue_maxsize" in kwargs:
+                try:
+                    new_max = max(1, min(4096, int(kwargs["io_queue_maxsize"])))
+                except (TypeError, ValueError):
+                    new_max = cfg.io_queue_maxsize
+                if new_max != cfg.io_queue_maxsize:
+                    cfg.io_queue_maxsize = new_max
+                    with self._io_cond:
+                        if self._io_pending == 0 and self._io_queue.empty():
+                            self._io_queue = queue.Queue(maxsize=new_max)
+                        else:
+                            self._io_queue.maxsize = new_max
             self._policy_memory = (
                 PolicyMemory(
                     path=Path(cfg.policy_memory_path).expanduser() if cfg.policy_memory_path else None,
@@ -425,8 +475,12 @@ class NervousSystem:
             )
         if self._config.enabled:
             self._ensure_worker()
+            self._ensure_io_worker()
+            if self._config.local_learning and not self._defer_io_active():
+                self._prime_outcome_cache_sync()
         else:
             self._stop_worker()
+            self._stop_io_worker()
 
     def _ensure_worker(self) -> None:
         with self._lock:
@@ -447,8 +501,207 @@ class NervousSystem:
             if self._worker is worker and (worker is None or not worker.is_alive()):
                 self._worker = None
 
+    def _ensure_io_worker(self) -> None:
+        with self._lock:
+            self._abandoned_io_workers[:] = [t for t in self._abandoned_io_workers if t.is_alive()]
+            if self._io_worker and self._io_worker.is_alive():
+                return
+            if len(self._abandoned_io_workers) >= _MAX_ABANDONED_IO_WORKERS:
+                return
+            stop_event = threading.Event()
+            self._io_stop_event = stop_event
+            q = self._io_queue
+            worker = threading.Thread(
+                target=self._run_io,
+                args=(q, stop_event),
+                name="hermes-nerve-nervous-io",
+                daemon=True,
+            )
+            self._io_worker = worker
+            worker.start()
+
+    def _stop_io_worker(self, *, drop_pending: bool = False, timeout: float = 0.5) -> None:
+        with self._lock:
+            worker = self._io_worker
+            stop_event = self._io_stop_event
+            q = self._io_queue
+        stop_event.set()
+        if drop_pending:
+            dropped = 0
+            with self._io_cond:
+                while True:
+                    try:
+                        item = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    q.task_done()
+                    if item is not _IO_STOP:
+                        dropped += 1
+                if dropped:
+                    self._io_pending = max(0, self._io_pending - dropped)
+                    if self._io_pending == 0:
+                        self._io_cond.notify_all()
+        if worker is None:
+            return
+        try:
+            q.put_nowait(_IO_STOP)
+        except queue.Full:
+            pass
+        if worker is not threading.current_thread():
+            worker.join(timeout=timeout)
+        with self._lock:
+            if self._io_worker is worker:
+                if not worker.is_alive():
+                    self._io_worker = None
+                elif drop_pending:
+                    self._abandoned_io_workers.append(worker)
+                    self._io_worker = None
+                    with self._io_cond:
+                        self._io_queue = queue.Queue(maxsize=self._config.io_queue_maxsize)
+                        self._io_pending = 0
+                        self._io_cond.notify_all()
+
+    @contextlib.contextmanager
+    def _nonblocking_io_scope(self):
+        depth = int(getattr(self._io_tls, "depth", 0) or 0)
+        self._io_tls.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._io_tls.depth = depth if depth > 0 else 0
+
+    def _defer_io_active(self) -> bool:
+        return int(getattr(self._io_tls, "depth", 0) or 0) > 0
+
+    def _enqueue_io(self, kind: str, op: Callable[[], None] | _DeferredJsonl) -> bool:
+        """Offload persistence/experience I/O onto bounded daemon worker without blocking hooks."""
+        with self._lock:
+            enabled = self._config.enabled
+            abandoned_full = (
+                (self._io_worker is None or not self._io_worker.is_alive())
+                and sum(1 for t in self._abandoned_io_workers if t.is_alive()) >= _MAX_ABANDONED_IO_WORKERS
+            )
+        if abandoned_full:
+            with self._lock:
+                self._metrics["io_queue_dropped"] += 1
+                self._metrics[f"io_queue_dropped_{kind}"] += 1
+            return False
+        ctx = contextvars.copy_context()
+        dropped = False
+        with self._io_cond:
+            try:
+                self._io_queue.put_nowait((kind, op, ctx))
+                self._io_pending += 1
+            except queue.Full:
+                dropped = True
+        if dropped:
+            with self._lock:
+                self._metrics["io_queue_dropped"] += 1
+                self._metrics[f"io_queue_dropped_{kind}"] += 1
+            return False
+        if enabled:
+            self._ensure_io_worker()
+        return True
+
+    def _run_io(self, q: queue.Queue[Any], stop_event: threading.Event) -> None:
+        while True:
+            if stop_event.is_set() and q.empty():
+                return
+            try:
+                first = q.get(timeout=0.25)
+            except queue.Empty:
+                if stop_event.is_set():
+                    return
+                continue
+            batch = [first]
+            use_batch_jsonl = (
+                append_jsonl is _STOCK_APPEND_JSONL
+                and _jsonl_mod.append_jsonl is _STOCK_APPEND_JSONL
+            )
+            if use_batch_jsonl:
+                while len(batch) < 64:
+                    try:
+                        batch.append(q.get_nowait())
+                    except queue.Empty:
+                        break
+            work_items: list[tuple[str, Any, contextvars.Context]] = []
+            saw_stop = False
+            for raw in batch:
+                if raw is _IO_STOP:
+                    q.task_done()
+                    saw_stop = True
+                else:
+                    work_items.append(raw)
+            if work_items:
+                if use_batch_jsonl:
+                    grouped_jsonl: dict[Path, list[_DeferredJsonl]] = {}
+                    other_ops: list[tuple[str, Any, contextvars.Context]] = []
+                    for kind, op, task_ctx in work_items:
+                        if isinstance(op, _DeferredJsonl):
+                            grouped_jsonl.setdefault(op.path, []).append(op)
+                        else:
+                            other_ops.append((kind, op, task_ctx))
+                    for path, entries in grouped_jsonl.items():
+                        try:
+                            must_exist = all(e.must_exist for e in entries)
+                            require_parent = any(e.require_parent for e in entries)
+                            append_jsonl_many(
+                                path,
+                                [e.record for e in entries],
+                                must_exist=must_exist,
+                                require_parent=require_parent,
+                            )
+                            with self._lock:
+                                self._initialized_paths.add(path)
+                        except Exception:
+                            with self._lock:
+                                for e in entries:
+                                    self._metrics[e.error_metric] += 1
+                    for _kind, fn, task_ctx in other_ops:
+                        try:
+                            task_ctx.run(fn)
+                        except Exception:
+                            with self._lock:
+                                self._metrics["io_worker_errors"] += 1
+                else:
+                    for _kind, op, task_ctx in work_items:
+                        try:
+                            if isinstance(op, _DeferredJsonl):
+                                try:
+                                    task_ctx.run(append_jsonl, op.path, op.record)
+                                except Exception:
+                                    with self._lock:
+                                        self._metrics[op.error_metric] += 1
+                            else:
+                                task_ctx.run(op)
+                        except Exception:
+                            with self._lock:
+                                self._metrics["io_worker_errors"] += 1
+                for _ in work_items:
+                    q.task_done()
+                with self._io_cond:
+                    if q is self._io_queue:
+                        self._io_pending = max(0, self._io_pending - len(work_items))
+                        if self._io_pending == 0:
+                            self._io_cond.notify_all()
+            if saw_stop and stop_event.is_set() and q.empty():
+                return
+
+    def flush_io(self, timeout: float = 5.0) -> bool:
+        """Wait for already-queued non-blocking I/O side effects; intended for tests and shutdown."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._io_cond:
+            while self._io_pending > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._io_cond.wait(timeout=remaining)
+            return True
+
     def shutdown(self) -> None:
-        """Disable live supervision, stop the worker, and release active turn/control state on plugin unload."""
+        """Disable live supervision, stop workers, and release active turn/control state on plugin unload."""
+        self.flush_io(timeout=0.05)
+        self._stop_io_worker(drop_pending=True, timeout=0.2)
         self.configure(enabled=False, admission_enabled=False)
         while True:
             try:
@@ -513,10 +766,152 @@ class NervousSystem:
     def _log(self, kind: str, payload: dict[str, Any]) -> None:
         record = {"schema": "hermes-nerve-nervous/v2", "timestamp": self._now(), "kind": kind, **redact(payload)}
         path = self._log_path()
+        if self._defer_io_active():
+            with self._lock:
+                already_created = path in self._initialized_paths
+            self._enqueue_io(
+                "log",
+                _DeferredJsonl(
+                    path,
+                    record,
+                    "log_errors",
+                    must_exist=already_created,
+                    require_parent=not already_created,
+                ),
+            )
+            return
         try:
             append_jsonl(path, record)
+            with self._lock:
+                self._initialized_paths.add(path)
         except Exception:
-            self._metrics["log_errors"] += 1
+            with self._lock:
+                self._metrics["log_errors"] += 1
+
+    def _append_outcome(self, row: dict[str, Any]) -> None:
+        store = self._outcomes
+        if isinstance(store, list):
+            store.append(row)
+            return
+        clean_row = redact(row)
+        out_path = store.path
+        with self._lock:
+            if self._outcome_cache is not None:
+                self._outcome_cache.append(clean_row)
+                if len(self._outcome_cache) > 2048:
+                    del self._outcome_cache[:-2048]
+            already_created = out_path in self._initialized_paths
+        if self._defer_io_active():
+            self._enqueue_io(
+                "outcome",
+                _DeferredJsonl(
+                    out_path,
+                    clean_row,
+                    "outcome_log_errors",
+                    must_exist=already_created,
+                    require_parent=not already_created,
+                ),
+            )
+            return
+        try:
+            append_jsonl(out_path, clean_row)
+            with self._lock:
+                self._initialized_paths.add(out_path)
+        except Exception:
+            with self._lock:
+                self._metrics["outcome_log_errors"] += 1
+
+    def _prime_outcome_cache_sync(self) -> None:
+        store = self._outcomes
+        if isinstance(store, list) or not hasattr(store, "path"):
+            return
+        with self._lock:
+            if self._outcome_cache is not None:
+                return
+            out_path = store.path
+        try:
+            disk_rows = read_jsonl(out_path)[-2048:] if out_path.is_file() else []
+        except Exception:
+            disk_rows = []
+        with self._lock:
+            if self._outcome_cache is None:
+                self._outcome_cache = disk_rows
+            else:
+                self._outcome_cache = (disk_rows + list(self._outcome_cache))[-2048:]
+
+    def _schedule_outcome_cache_warm(self) -> None:
+        store = self._outcomes
+        if isinstance(store, list) or not hasattr(store, "path"):
+            return
+        with self._lock:
+            if self._outcome_cache is not None or self._outcome_cache_warming:
+                return
+            self._outcome_cache = []
+            self._outcome_cache_warming = True
+            out_path = store.path
+
+        def _warm() -> None:
+            try:
+                disk_rows = read_jsonl(out_path)[-2048:]
+            except Exception:
+                disk_rows = []
+            with self._lock:
+                live = list(self._outcome_cache or [])
+                merged = (disk_rows + live)[-2048:]
+                self._outcome_cache = merged
+                self._outcome_cache_warming = False
+
+        self._enqueue_io("outcome_warm", _warm)
+
+    def _predict_historical(self, features: dict[str, Any]) -> tuple[float | None, int]:
+        if not self._defer_io_active():
+            return self._historical_model.predict(features)
+        with self._lock:
+            if self._outcome_cache is None:
+                need_warm = True
+                rows: list[dict[str, Any]] = []
+            else:
+                need_warm = False
+                rows = list(self._outcome_cache)
+            min_samples = max(3, int(self._config.local_learning_min_samples))
+        if need_warm:
+            self._schedule_outcome_cache_warm()
+        if not rows:
+            return None, 0
+        event_type = str(features.get("decision_type") or features.get("type") or "")
+        objective_type = str(features.get("objective_type") or features.get("scope") or "")
+        decision_rows = {str(r.get("event_id") or ""): r for r in rows if r.get("record_type") == "decision"}
+        labels: list[int] = []
+        for row in rows:
+            if row.get("record_type") != "outcome" or "useful_disagreement" not in row:
+                continue
+            prior = decision_rows.get(str(row.get("event_id") or ""), {})
+            if event_type and str(prior.get("decision_type") or "") != event_type:
+                continue
+            if objective_type and str(prior.get("objective_type") or "") not in {"", objective_type}:
+                continue
+            labels.append(1 if row.get("useful_disagreement") is True else 0)
+        if len(labels) < min_samples:
+            return None, len(labels)
+        return (sum(labels) + 1.0) / (len(labels) + 2.0), len(labels)
+
+    def _record_experience(self, op: Callable[[Any], Any]) -> None:
+        exp_path = experience.experience_path()
+        factory = experience.default_store
+        is_stock_factory = factory is _STOCK_EXPERIENCE_DEFAULT_STORE
+
+        def _persist() -> None:
+            try:
+                store = experience.ExperienceStore(exp_path) if is_stock_factory else factory()
+                op(store)
+            except Exception:
+                with self._lock:
+                    self._metrics["experience_errors"] += 1
+
+        if self._defer_io_active():
+            self._enqueue_io("experience", _persist)
+            return
+        _persist()
 
     def _resolve_turn(self, *, turn_id: str = "", session_id: str = "") -> TurnState | None:
         with self._lock:
@@ -740,8 +1135,31 @@ class NervousSystem:
             return None
 
     def _log_receipt(self, receipt: dict[str, Any] | None) -> None:
-        if receipt is not None:
-            self._log("accounting_receipt", receipt)
+        if receipt is None:
+            return
+        record = {"schema": "hermes-nerve-nervous/v2", "timestamp": self._now(), "kind": "accounting_receipt", **redact(receipt)}
+        path = self._log_path()
+        if self._defer_io_active():
+            with self._lock:
+                already_created = path in self._initialized_paths
+            self._enqueue_io(
+                "receipt",
+                _DeferredJsonl(
+                    path,
+                    record,
+                    "log_errors",
+                    must_exist=already_created,
+                    require_parent=not already_created,
+                ),
+            )
+            return
+        try:
+            append_jsonl(path, record)
+            with self._lock:
+                self._initialized_paths.add(path)
+        except Exception:
+            with self._lock:
+                self._metrics["log_errors"] += 1
 
     def accounting_receipts(
         self,
@@ -894,7 +1312,7 @@ class NervousSystem:
             "attempted_override": attempted_override,
             "timestamp": self._now(),
         }
-        self._outcomes.append(row)
+        self._append_outcome(row)
         self._log("control_lifecycle", row)
 
     def _activate_control(self, state: TurnState, directive: ControlDirective) -> None:
@@ -942,7 +1360,7 @@ class NervousSystem:
         episode.last_decision_id = decision_id
         self._metrics[metric] += 1
         self._metrics["control_replan"] += 1
-        self._outcomes.append({
+        self._append_outcome({
             "record_type": "decision",
             "decision_id": decision_id,
             "turn_id": state.turn_id,
@@ -961,25 +1379,23 @@ class NervousSystem:
             "stale": False,
         })
         if experience.enabled() and episode.last_event_id:
-            try:
-                experience.default_store().create_claim(
-                    subject=f"failure:{episode.fingerprint}",
-                    statement=f"Retrying action {episode.action_fingerprint or 'unchanged-action'} is disproven for this failure: {reason}",
-                    claim_type="disproven",
-                    evidence_ids=[episode.last_event_id],
-                    confidence=1.0,
-                    polarity=-1,
-                    provenance={
-                        "decision_id": decision_id,
-                        "source": source,
-                        "failure_fingerprint": episode.fingerprint,
-                        "failure_repeat_count": episode.count,
-                    },
-                    tags=["negative-knowledge", "failure-fingerprint", decision_type.lower()],
-                    admit=False,
-                )
-            except Exception:
-                pass
+            claim_kwargs = {
+                "subject": f"failure:{episode.fingerprint}",
+                "statement": f"Retrying action {episode.action_fingerprint or 'unchanged-action'} is disproven for this failure: {reason}",
+                "claim_type": "disproven",
+                "evidence_ids": [episode.last_event_id],
+                "confidence": 1.0,
+                "polarity": -1,
+                "provenance": {
+                    "decision_id": decision_id,
+                    "source": source,
+                    "failure_fingerprint": episode.fingerprint,
+                    "failure_repeat_count": episode.count,
+                },
+                "tags": ["negative-knowledge", "failure-fingerprint", decision_type.lower()],
+                "admit": False,
+            }
+            self._record_experience(lambda store, kw=claim_kwargs: store.create_claim(**kw))
         self._activate_control(state, directive)
         challenge = Challenge(
             challenge_id=uuid.uuid4().hex,
@@ -1115,35 +1531,32 @@ class NervousSystem:
                 self._metrics["nerve_internal_seen"] += 1
                 self._metrics["nerve_internal_suppressed"] += 1
         if clean["type"] in {"OUTCOME", "CHALLENGE_OUTCOME"}:
-            self._outcomes.append({"record_type": "outcome", **clean})
+            self._append_outcome({"record_type": "outcome", **clean})
             if experience.enabled():
                 claim_id = str(clean.get("claim_id") or "").strip()
                 if claim_id and "successful" in clean:
-                    try:
-                        experience.default_store().record_outcome(
-                            claim_id,
-                            successful=bool(clean.get("successful")),
-                            decision_id=str(clean.get("decision_id") or ""),
-                            receipt_id=str(clean.get("receipt_id") or ""),
-                            tokens_saved=int(clean.get("tokens_saved") or 0),
-                            note=str(clean.get("summary") or clean.get("outcome") or ""),
-                        )
-                    except Exception:
-                        pass
+                    outcome_kwargs = {
+                        "successful": bool(clean.get("successful")),
+                        "decision_id": str(clean.get("decision_id") or ""),
+                        "receipt_id": str(clean.get("receipt_id") or ""),
+                        "tokens_saved": int(clean.get("tokens_saved") or 0),
+                        "note": str(clean.get("summary") or clean.get("outcome") or ""),
+                    }
+                    self._record_experience(
+                        lambda store, cid=claim_id, kw=outcome_kwargs: store.record_outcome(cid, **kw)
+                    )
                 fingerprint = str(clean.get("failure_fingerprint") or "").strip()
                 recovery = str(clean.get("recovery") or clean.get("next_action") or "").strip()
                 if fingerprint and recovery and "successful" in clean:
-                    try:
-                        experience.default_store().record_recovery(
-                            fingerprint=fingerprint,
-                            recovery=recovery,
-                            successful=bool(clean.get("successful")),
-                            evidence_ids=[str(clean.get("event_id") or "")],
-                            scope=clean.get("scope") if isinstance(clean.get("scope"), dict) else None,
-                            tokens_saved=int(clean.get("tokens_saved") or 0),
-                        )
-                    except Exception:
-                        pass
+                    recovery_kwargs = {
+                        "fingerprint": fingerprint,
+                        "recovery": recovery,
+                        "successful": bool(clean.get("successful")),
+                        "evidence_ids": [str(clean.get("event_id") or "")],
+                        "scope": clean.get("scope") if isinstance(clean.get("scope"), dict) else None,
+                        "tokens_saved": int(clean.get("tokens_saved") or 0),
+                    }
+                    self._record_experience(lambda store, kw=recovery_kwargs: store.record_recovery(**kw))
             self._metrics["outcomes_recorded"] += 1
             self._log("outcome", clean)
             return {"accepted": True, "forwarded": False, "reason": "outcome-recorded"}
@@ -1167,7 +1580,7 @@ class NervousSystem:
         learned_probability = None
         learned_samples = 0
         if self._config.local_learning:
-            learned_probability, learned_samples = self._historical_model.predict(clean)
+            learned_probability, learned_samples = self._predict_historical(clean)
             if learned_probability is not None and not route.critical:
                 learned_threshold = self._config.call_threshold
                 if learned_probability >= 0.60:
@@ -1272,6 +1685,10 @@ class NervousSystem:
     def observe_tool_call(self, **kwargs: Any) -> dict[str, Any]:
         if not self._config.enabled:
             return {"accepted": False, "reason": "nervous-disabled"}
+        with self._nonblocking_io_scope():
+            return self._observe_tool_call_impl(**kwargs)
+
+    def _observe_tool_call_impl(self, **kwargs: Any) -> dict[str, Any]:
         tool_name = str(kwargs.get("tool_name") or "")
         status = str(kwargs.get("status") or "")
         raw_args = kwargs.get("args")
@@ -1484,14 +1901,23 @@ class NervousSystem:
         if is_failure and state is not None:
             if (policy_memory_reason and repeat_count == 1
                     and self._policy_memory is not None and not active_blocking):
-                remembered = self._policy_memory.remember(
-                    tool_name=tool_name,
-                    reason=policy_memory_reason,
-                    evidence_fingerprint=fail_fp or action_fp,
-                )
-                if remembered is not None:
-                    with self._lock:
-                        self._metrics["policy_memory_records"] += 1
+                pm = self._policy_memory
+                ev_fp = fail_fp or action_fp
+
+                def _persist_policy() -> None:
+                    remembered = pm.remember(
+                        tool_name=tool_name,
+                        reason=policy_memory_reason,
+                        evidence_fingerprint=ev_fp,
+                    )
+                    if remembered is not None:
+                        with self._lock:
+                            self._metrics["policy_memory_records"] += 1
+
+                if self._defer_io_active():
+                    self._enqueue_io("policy_memory", _persist_policy)
+                else:
+                    _persist_policy()
             if repeat_count >= 2:
                 event_type = "REPEATED_FAILURE"
         self._log_receipt(post_receipt)
@@ -1922,7 +2348,7 @@ class NervousSystem:
                 "action_fingerprint": str(event.get("action_fingerprint") or ""),
                 "stale": False,
             }
-            self._outcomes.append(decision_row)
+            self._append_outcome(decision_row)
 
             if should_challenge:
                 directive = ControlDirective(
@@ -2616,17 +3042,28 @@ class NervousSystem:
             }
 
     def drain(self, timeout: float = 5.0) -> bool:
-        """Wait for already-queued background work; intended for tests and diagnostics."""
+        """Wait for already-queued background work and non-blocking I/O; intended for tests and diagnostics."""
         deadline = time.monotonic() + max(0.0, float(timeout))
         while time.monotonic() < deadline:
             if self._tasks.unfinished_tasks == 0:
                 with self._lock:
-                    if not any(state.assessment_inflight for state in self._turns.values()):
-                        return True
+                    inflight = any(state.assessment_inflight for state in self._turns.values())
+                if not inflight:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if not self.flush_io(timeout=remaining):
+                        return False
+                    if self._tasks.unfinished_tasks == 0:
+                        with self._lock:
+                            if not any(state.assessment_inflight for state in self._turns.values()):
+                                with self._io_cond:
+                                    if self._io_pending == 0:
+                                        return True
             time.sleep(0.01)
         return False
 
     def quality_metrics(self) -> dict[str, Any]:
+        if not self._defer_io_active():
+            self.flush_io(timeout=0.05)
         with self._lock:
             m = dict(self._metrics)
             turns = int(m.get("turns_started", 0))
@@ -2785,6 +3222,14 @@ def configure(**kwargs: Any) -> None:
 
 def shutdown() -> None:
     _default.shutdown()
+
+
+def flush_io(timeout: float = 5.0) -> bool:
+    return _default.flush_io(timeout=timeout)
+
+
+def drain(timeout: float = 5.0) -> bool:
+    return _default.drain(timeout=timeout)
 
 
 def pre_llm_call(**kwargs: Any) -> str | None:
