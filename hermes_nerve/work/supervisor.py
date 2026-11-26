@@ -25,6 +25,11 @@ from .models import (
     utc_now,
 )
 from .progress import project
+from .packet_bound import (
+    COMPLETION_BATCH_INSTRUCTIONS,
+    bound_completion_packet,
+    partition_completion_batches,
+)
 from .store import SupervisionStore
 from .economics import usage_parts
 
@@ -448,7 +453,7 @@ class CardSupervisor:
             )
 
         if missing:
-            # One batched semantic call is reserved only for criteria that the
+            # Bounded semantic verification is reserved only for criteria that the
             # deterministic controller could not evaluate at all. PASS may upgrade
             # those UNKNOWN/NEEDS_EVIDENCE criteria, never deterministic failures.
             evidence = self.store.evidence(identity)
@@ -460,53 +465,97 @@ class CardSupervisor:
                     reason="Required criteria are not independently verified and no observed evidence is attached to this run.",
                     missing_criteria=missing,
                 )
-            packet = {
-                "goal": contract.goal,
-                "remaining_criteria": [
-                    c.as_dict() for c in contract.criteria if c.id in set(missing)
-                ],
-                "evidence": [
-                    {
-                        "evidence_id": e["evidence_id"], "criterion_id": e.get("criterion_id"),
-                        "kind": e["kind"], "preview": e["preview"], "tool_name": e.get("tool_name") or "",
-                        "is_error": bool(e.get("is_error")),
-                    }
-                    for e in evidence[-24:]
-                ],
-                "proposal": redact(proposal or {}),
-            }
-            try:
-                result = self.engine_factory().verify(
-                    state=packet,
-                    instructions=(
-                        "Verify the remaining locked Definition-of-Done criteria as one batch. PASS only if the independently "
-                        "observed evidence plus completion proposal proves every listed criterion. RETRY means the current approach "
-                        "is valid but more execution/evidence is required; REPLAN means the approach must change; ESCALATE means "
-                        "human/external judgment is required."
-                    ),
-                    contract="work-completion-batch/v1",
+            remaining_specs = [c.as_dict() for c in contract.criteria if c.id in set(missing)]
+            raw_evidence = [
+                {
+                    "evidence_id": e["evidence_id"],
+                    "criterion_id": e.get("criterion_id"),
+                    "kind": e["kind"],
+                    "preview": e["preview"],
+                    "tool_name": e.get("tool_name") or "",
+                    "is_error": bool(e.get("is_error")),
+                }
+                for e in evidence
+            ]
+            redacted_proposal = redact(proposal or {})
+            if len(remaining_specs) <= 1:
+                batches: list[dict[str, Any]] | None = [
+                    bound_completion_packet(
+                        goal=contract.goal,
+                        remaining_criteria=remaining_specs,
+                        evidence=raw_evidence,
+                        proposal=redacted_proposal,
+                    )
+                ]
+            else:
+                batches = partition_completion_batches(
+                    goal=contract.goal,
+                    remaining_criteria=remaining_specs,
+                    evidence=raw_evidence,
+                    proposal=redacted_proposal,
                 )
-            except Exception as exc:
-                return CompletionVerdict(False, "ESCALATE", 0.0, f"Completion verification unavailable: {type(exc).__name__}: {exc}", missing_criteria=missing)
-            self._record_result_usage(identity, result, purpose="completion_batch")
-            value = str(getattr(result, "value", "ESCALATE")).upper()
-            if value != "PASS":
+            if batches is None:
                 return CompletionVerdict(
                     allow=False,
-                    value=value,
-                    confidence=float(getattr(result, "confidence", 0.0) or 0.0),
-                    reason=f"Reflex batched completion verdict {value}.",
-                    receipt_id=str(getattr(result, "receipt_id", "") or ""),
+                    value="ESCALATE",
+                    confidence=0.0,
+                    reason="Unmet completion criteria exceed bounded verification batch cap.",
                     missing_criteria=missing,
                 )
+
+            batch_receipts: list[tuple[list[str], str]] = []
+            batch_confidences: list[float] = []
+            last_receipt_id = ""
+            for batch_packet in batches:
+                try:
+                    result = self.engine_factory().verify(
+                        state=batch_packet,
+                        instructions=COMPLETION_BATCH_INSTRUCTIONS,
+                        contract="work-completion-batch/v1",
+                    )
+                except Exception as exc:
+                    return CompletionVerdict(
+                        False,
+                        "ESCALATE",
+                        0.0,
+                        f"Completion verification unavailable: {type(exc).__name__}: {exc}",
+                        missing_criteria=missing,
+                    )
+                self._record_result_usage(identity, result, purpose="completion_batch")
+                value = str(getattr(result, "value", "ESCALATE")).upper()
+                conf = float(getattr(result, "confidence", 0.0) or 0.0)
+                receipt_id = str(getattr(result, "receipt_id", "") or "")
+                if value != "PASS":
+                    return CompletionVerdict(
+                        allow=False,
+                        value=value,
+                        confidence=conf,
+                        reason=f"Reflex batched completion verdict {value}.",
+                        receipt_id=receipt_id,
+                        missing_criteria=missing,
+                    )
+                covered_ids = [
+                    str(c.get("id"))
+                    for c in (batch_packet.get("remaining_criteria") or [])
+                    if isinstance(c, dict) and c.get("id")
+                ]
+                batch_receipts.append((covered_ids, receipt_id))
+                batch_confidences.append(conf)
+                last_receipt_id = receipt_id
+
             evidence_ids = [str(e["evidence_id"]) for e in evidence]
+            receipt_by_cid = {
+                cid: rec_id
+                for covered_ids, rec_id in batch_receipts
+                for cid in covered_ids
+            }
             for cid in missing:
                 self.store.save_verdict(
                     identity,
                     criterion_id=cid,
                     state="VERIFIED_PASS",
                     reason="Batched Reflex semantic completion verification PASS.",
-                    receipt_id=str(getattr(result, "receipt_id", "") or ""),
+                    receipt_id=receipt_by_cid.get(cid, last_receipt_id),
                     evidence_ids=evidence_ids,
                     created_at=utc_now(),
                 )
@@ -516,9 +565,9 @@ class CardSupervisor:
             return CompletionVerdict(
                 allow=True,
                 value="PASS",
-                confidence=float(getattr(result, "confidence", 0.0) or 0.0),
+                confidence=min(batch_confidences) if batch_confidences else 0.0,
                 reason="All required criteria are independently verified; batched Reflex semantic verification PASS.",
-                receipt_id=str(getattr(result, "receipt_id", "") or ""),
+                receipt_id=last_receipt_id,
                 decision_id="reflexcomplete-" + uuid.uuid4().hex,
             )
         # When deterministic evidence proved every requirement, do not spend a

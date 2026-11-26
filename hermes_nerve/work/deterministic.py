@@ -46,10 +46,287 @@ def _terminal_exit(result: Any, kwargs: dict[str, Any]) -> tuple[int | None, str
     return None, text
 
 
-def _extract_crew_verdict_call(tool_name: str, args: dict[str, Any] | None, result: Any) -> tuple[str | None, Any]:
+_TERMINAL_TOOLS = {"terminal", "terminal.exec", "shell", "bash"}
+_BENIGN_SHELL_SETUP = {"cd", "pushd", "set-location", "sl", "export", "set"}
+_PYTHON_BIN_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|py|uv)(?:\.exe)?$", re.I)
+_CLI_VERDICT_LINE_RE = re.compile(r"(?m)^\s*verdict:\s*(PASS|FAIL)\b")
+_CLI_RC_LINE_RE = re.compile(r"(?im)(?:^\s*rc=(-?\d+)\s*$|\bexit[ _]code\s*[:=]\s*(-?\d+)\b)")
+
+
+def _tokenize_cli_segment(segment: str) -> list[str] | None:
+    tokens: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if quote is not None:
+            if quote == '"' and ch == "\\" and i + 1 < n and segment[i + 1] == '"':
+                cur.append('"')
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in {'"', "'"}:
+            quote = ch
+            i += 1
+            continue
+        if ch.isspace():
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if quote is not None:
+        return None
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _parse_cli_verdict_command(command: str) -> str | None:
+    if not command or "crew_card.py" not in command.lower():
+        return None
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] == '"':
+                buf.append(command[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in {'"', "'"}:
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if command[i : i + 2] == "||" or ch == "|":
+            return None
+        if command[i : i + 2] == "&&":
+            seg = "".join(buf).strip()
+            if seg:
+                segments.append(seg)
+            buf = []
+            i += 2
+            continue
+        if ch in {";", "\n"}:
+            seg = "".join(buf).strip()
+            if seg:
+                segments.append(seg)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if quote is not None:
+        return None
+    tail = "".join(buf).strip()
+    if tail:
+        segments.append(tail)
+    if not segments:
+        return None
+
+    for prefix_seg in segments[:-1]:
+        ptoks = _tokenize_cli_segment(prefix_seg)
+        if not ptoks:
+            return None
+        head = ptoks[0].lower()
+        if head in _BENIGN_SHELL_SETUP or head.startswith("$env:") or ("=" in ptoks[0] and not ptoks[0].startswith("-")):
+            continue
+        return None
+
+    tokens = _tokenize_cli_segment(segments[-1])
+    if not tokens:
+        return None
+    idx = 0
+    if tokens[idx] == "&":
+        idx += 1
+    while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("-"):
+        idx += 1
+    if idx >= len(tokens):
+        return None
+
+    def _base(tok: str) -> str:
+        return re.split(r"[\\/]", tok)[-1].lower()
+
+    first_base = _base(tokens[idx])
+    if first_base == "crew_card.py":
+        script_idx = idx
+    elif _PYTHON_BIN_RE.match(first_base):
+        idx += 1
+        if first_base.startswith("uv") and idx < len(tokens) and tokens[idx] == "run":
+            idx += 1
+        while idx < len(tokens) and tokens[idx].startswith("-"):
+            flag = tokens[idx]
+            if flag in {"-c", "-m", "--command"} or flag.startswith(("-c", "-m")):
+                return None
+            if flag in {"-W", "-X", "--python"}:
+                idx += 2
+            else:
+                idx += 1
+        if idx >= len(tokens) or _base(tokens[idx]) != "crew_card.py":
+            return None
+        script_idx = idx
+    else:
+        return None
+
+    sub_idx = script_idx + 1
+    if sub_idx >= len(tokens) or tokens[sub_idx] != "verdict":
+        return None
+
+    card_id = ""
+    j = sub_idx + 1
+    while j < len(tokens):
+        tok = tokens[j]
+        if tok == "--card" and j + 1 < len(tokens):
+            card_id = tokens[j + 1].strip()
+            j += 2
+            continue
+        if tok.startswith("--card="):
+            card_id = tok.split("=", 1)[1].strip()
+        j += 1
+    if not card_id or card_id.startswith("-"):
+        return None
+    return card_id
+
+
+def _parse_cli_verdict_result(
+    result: Any,
+    kwargs: dict[str, Any] | None,
+    *,
+    card_id: str,
+) -> dict[str, Any] | None:
+    kw = kwargs or {}
+    status = str(kw.get("status") or "").strip().lower()
+    is_status_error = status in {"error", "failed", "failure"}
+
+    payload: dict[str, Any] | None = None
+    stdout_text = ""
+    if isinstance(result, dict):
+        payload = dict(result)
+    elif isinstance(result, str):
+        stdout_text = result
+        try:
+            decoded = json.loads(result)
+            if isinstance(decoded, dict):
+                payload = decoded
+        except Exception:
+            payload = None
+    else:
+        stdout_text = json.dumps(result, default=str)
+
+    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+        payload = dict(payload["result"])
+    elif isinstance(payload, dict) and isinstance(payload.get("result"), str):
+        try:
+            inner = json.loads(payload["result"])
+            if isinstance(inner, dict):
+                payload = inner
+            else:
+                stdout_text = payload["result"]
+        except Exception:
+            stdout_text = payload["result"]
+
+    rc: int | None = None
+    for src in (payload or {}, kw):
+        for key in ("exit_code", "returncode", "code", "rc", "proof_rc"):
+            if isinstance(src, dict) and src.get(key) is not None and str(src.get(key)).strip() != "":
+                try:
+                    rc = int(src[key])
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if rc is not None:
+            break
+
+    if isinstance(payload, dict):
+        explicit_card = str(payload.get("card") or "").strip()
+        if explicit_card and explicit_card != card_id:
+            return None
+        json_verdict = str(payload.get("verdict") or payload.get("value") or "").strip().upper()
+        if json_verdict in {"PASS", "FAIL"}:
+            if json_verdict == "PASS" and (is_status_error or (rc is not None and rc != 0)):
+                return {"verdict": "FAIL", "rc": rc if (rc is not None and rc != 0) else 1, "card": card_id}
+            out_dict: dict[str, Any] = {
+                "verdict": json_verdict,
+                "rc": 0 if json_verdict == "PASS" else (rc if (rc is not None and rc != 0) else 1),
+                "card": card_id,
+            }
+            for fkey in ("file", "artifact"):
+                if payload.get(fkey):
+                    out_dict[fkey] = payload[fkey]
+            return out_dict
+        for tkey in ("output", "stdout", "text"):
+            if isinstance(payload.get(tkey), str):
+                stdout_text = payload[tkey]
+                break
+
+    if rc is None and stdout_text:
+        rc_m = _CLI_RC_LINE_RE.search(stdout_text)
+        if rc_m:
+            raw_code = rc_m.group(1) if rc_m.group(1) is not None else rc_m.group(2)
+            try:
+                rc = int(raw_code)
+            except (TypeError, ValueError):
+                rc = None
+
+    m = _CLI_VERDICT_LINE_RE.search(stdout_text)
+    if m:
+        parsed_verdict = m.group(1).upper()
+        if parsed_verdict == "PASS":
+            if is_status_error or (rc is not None and rc != 0):
+                return {"verdict": "FAIL", "rc": rc if (rc is not None and rc != 0) else 1, "card": card_id}
+            return {"verdict": "PASS", "rc": 0, "card": card_id}
+        eff_rc = rc if (rc is not None and rc != 0) else (3 if "handed back" in stdout_text.lower() else 1)
+        return {"verdict": "FAIL", "rc": eff_rc, "card": card_id}
+
+    low = stdout_text.lstrip().lower()
+    if low.startswith("refused:") or low.startswith("verdict: blocked"):
+        return None
+    if rc in {1, 3}:
+        return {"verdict": "FAIL", "rc": rc, "card": card_id}
+    return None
+
+
+def _extract_crew_verdict_call(
+    tool_name: str,
+    args: dict[str, Any] | None,
+    result: Any,
+    *,
+    expected_task_id: str | None = None,
+    kwargs: dict[str, Any] | None = None,
+) -> tuple[str | None, Any]:
     tn = str(tool_name or "").strip().lower()
     if tn in {"crew_verdict", "crew_review_handoff", "crew_review"}:
         return tn, result
+    if tn in _TERMINAL_TOOLS:
+        command = str((args or {}).get("command") or (args or {}).get("cmd") or "")
+        cid = _parse_cli_verdict_command(command)
+        if cid is None:
+            return None, result
+        if expected_task_id is not None and cid != expected_task_id:
+            return None, result
+        parsed_cli = _parse_cli_verdict_result(result, kwargs, card_id=cid)
+        if parsed_cli is None:
+            return None, result
+        return "crew_verdict_cli", parsed_cli
     if tn == "tool_call" and isinstance(args, dict):
         calls = args.get("calls")
         if isinstance(calls, list):
@@ -57,24 +334,45 @@ def _extract_crew_verdict_call(tool_name: str, args: dict[str, Any] | None, resu
                 if not isinstance(item, dict):
                     continue
                 cname = str(item.get("name") or "").strip().lower()
-                if cname in {"crew_verdict", "crew_review_handoff", "crew_review"}:
-                    sub_res = result
-                    if isinstance(result, str):
-                        try:
-                            parsed = json.loads(result)
-                            if isinstance(parsed, dict) and isinstance(parsed.get("results"), list) and idx < len(parsed["results"]):
-                                sub_res = parsed["results"][idx]
-                        except Exception:
-                            pass
-                    elif isinstance(result, dict) and isinstance(result.get("results"), list) and idx < len(result["results"]):
-                        sub_res = result["results"][idx]
-                    return cname, sub_res
+                sub_args = item.get("arguments")
+                if isinstance(sub_args, str):
+                    try:
+                        sub_args = json.loads(sub_args)
+                    except Exception:
+                        sub_args = {}
+                if not isinstance(sub_args, dict):
+                    sub_args = item.get("args") if isinstance(item.get("args"), dict) else {}
+                sub_res = result
+                if isinstance(result, str):
+                    try:
+                        parsed = json.loads(result)
+                        if isinstance(parsed, dict) and isinstance(parsed.get("results"), list) and idx < len(parsed["results"]):
+                            sub_res = parsed["results"][idx]
+                    except Exception:
+                        pass
+                elif isinstance(result, dict) and isinstance(result.get("results"), list) and idx < len(result["results"]):
+                    sub_res = result["results"][idx]
+                extracted_name, extracted_res = _extract_crew_verdict_call(
+                    cname,
+                    sub_args,
+                    sub_res,
+                    expected_task_id=expected_task_id,
+                    kwargs=kwargs,
+                )
+                if extracted_name is not None:
+                    return extracted_name, extracted_res
     return None, result
 
 
 def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Zero-token observer for Crew verdicts (`provider_calls == 0`)."""
-    tn, unwrapped = _extract_crew_verdict_call(tool_name, args, result)
+    tn, unwrapped = _extract_crew_verdict_call(
+        tool_name,
+        args,
+        result,
+        expected_task_id=identity.task_id,
+        kwargs=kwargs,
+    )
     if tn is None:
         return {"observed": False, "passed": False, "failed": False, "provider_calls": 0}
     text = unwrapped if isinstance(unwrapped, str) else None
@@ -105,7 +403,7 @@ def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, a
         except (TypeError, ValueError):
             rc = 1
 
-    if tn != "crew_verdict" and verdict != "PASS":
+    if tn not in {"crew_verdict", "crew_verdict_cli"} and verdict != "PASS":
         return {"observed": False, "passed": False, "failed": False, "provider_calls": 0}
     if not verdict and rc is None:
         return {"observed": False, "passed": False, "failed": False, "provider_calls": 0}
@@ -166,8 +464,14 @@ def observe_crew_verdict(supervisor, identity: RunIdentity, *, tool_name: str, a
 
 
 def observe_test_result(supervisor, identity: RunIdentity, *, tool_name: str, args: dict[str, Any], result: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    tn, _ = _extract_crew_verdict_call(tool_name, args, result)
-    if tn == "crew_verdict":
+    tn, _ = _extract_crew_verdict_call(
+        tool_name,
+        args,
+        result,
+        expected_task_id=identity.task_id,
+        kwargs=kwargs,
+    )
+    if tn in {"crew_verdict", "crew_verdict_cli"}:
         return observe_crew_verdict(
             supervisor, identity, tool_name=tool_name, args=args, result=result, kwargs=kwargs
         )

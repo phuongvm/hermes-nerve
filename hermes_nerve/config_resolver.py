@@ -19,6 +19,7 @@ class ResolvedNerveConfig:
     ignored_settings_profile: str = ""
     override_sources: dict[str, str] = field(default_factory=dict)
     module_conflicts: list[dict[str, object]] = field(default_factory=list)
+    advanced_override_sources: dict[str, str] = field(default_factory=dict)
 
     def enabled(self, module: str) -> bool:
         return bool(self.modules.get(module, False))
@@ -86,6 +87,10 @@ def resolve_config(get_config: Callable | None = None, *, home=None, profile: di
         raise ValueError(f"Unknown Nerve profile: {name}")
 
     advanced = dict(document.get("advanced", {})) if use_sidecar_values and document else {}
+    advanced_override_sources: dict[str, str] = {}
+    if use_sidecar_values and "work_supervision_mode" in advanced:
+        if advanced["work_supervision_mode"] != getter("work_supervision_mode", None):
+            advanced_override_sources["work_supervision_mode"] = "profile.json:advanced"
 
     def get(key, default=None):
         return advanced[key] if key in advanced else getter(key, default)
@@ -168,7 +173,17 @@ def resolve_config(get_config: Callable | None = None, *, home=None, profile: di
                     reasons[key] = "requires " + ", ".join(missing)
                     changed = True
 
-    return ResolvedNerveConfig(name, modules, advanced, reasons, getter, ignored_settings_profile, override_sources, module_conflicts)
+    return ResolvedNerveConfig(
+        name,
+        modules,
+        advanced,
+        reasons,
+        getter,
+        ignored_settings_profile,
+        override_sources,
+        module_conflicts,
+        advanced_override_sources,
+    )
 
 
 resolve_nerve_config = resolve_config
