@@ -96,192 +96,192 @@ class PluginUnloadTests(unittest.TestCase):
             home = Path(td)
             with patch.dict(os.environ, self._isolated_env(td), clear=False):
                 mod = _load_fresh_plugin("nerve_unload_modular")
-                no_remote = mod.nervous.NervousSystem(
+                with mod.nervous.NervousSystem(
                     engine_factory=lambda: (_ for _ in ()).throw(RuntimeError("offline test"))
-                )
-                mod.nervous._default = no_remote
+                ) as no_remote:
+                    mod.nervous._default = no_remote
 
-                ctx = UnloadableHostCtx(
-                    home,
-                    {
-                        "nerve_profile": "fat_cat",
-                        "gate_mode": "advisory",
-                        "nervous_enabled": True,
-                        "nervous_turn_admission": True,
-                        "nervous_emit_prompt_hint": True,
-                        "selective_context_enabled": True,
-                        "selective_context_memory_mode": "apply",
-                    },
-                )
-                mod.register(ctx)
-
-                # Seed an admitted verified-experience claim so memory_context emits [Nerve selected memory].
-                store = mod.experience.default_store()
-                claim = store.create_claim(
-                    subject="plugin-unload-architecture",
-                    statement="Plugin disable must detach sticky pre_llm_call memory hooks immediately.",
-                    claim_type="verified",
-                    evidence_ids=["ev-unload-1"],
-                    confidence=0.95,
-                    admit=True,
-                )
-                self.assertTrue(claim["admitted"])
-
-                before = mod.nervous.report()
-                self.assertTrue(before["enabled"])
-                self.assertTrue(before["admission_enabled"])
-                self.assertTrue(mod.selective_context.report()["enabled"])
-                self.assertEqual(mod.gate.gate_mode(), "advisory")
-                self.assertTrue(mod.work_runtime.enabled())
-
-                pre_llm_cbs = [cb for name, cb in ctx.hooks if name == "pre_llm_call"]
-                pre_tool_cbs = [cb for name, cb in ctx.hooks if name == "pre_tool_call"]
-                mw_cbs = [cb for kind, cb in ctx.middleware if kind == "llm_request"]
-                self.assertGreaterEqual(len(pre_llm_cbs), 2)
-                self.assertEqual(len(pre_tool_cbs), 1)
-                self.assertEqual(len(mw_cbs), 1)
-
-                outputs = [
-                    cb(
-                        session_id="ae56b4",
-                        turn_id="turn-before-unload",
-                        user_message="check plugin-unload-architecture sticky memory hooks",
+                    ctx = UnloadableHostCtx(
+                        home,
+                        {
+                            "nerve_profile": "fat_cat",
+                            "gate_mode": "advisory",
+                            "nervous_enabled": True,
+                            "nervous_turn_admission": True,
+                            "nervous_emit_prompt_hint": True,
+                            "selective_context_enabled": True,
+                            "selective_context_memory_mode": "apply",
+                        },
                     )
-                    for cb in pre_llm_cbs
-                ]
-                rendered = "\n".join(
-                    item["context"] if isinstance(item, dict) else str(item)
-                    for item in outputs
-                    if item is not None
-                )
-                self.assertIn("[Nerve selected memory", rendered)
-                self.assertIn("Nerve nervous supervision is active", rendered)
-                self.assertEqual(mod.nervous.report()["active_turns"], 1)
+                    mod.register(ctx)
 
-                # Unload plugin: must register on_unload and tear down all live Nerve state.
-                self.assertTrue(ctx._unload_callbacks, "register(ctx) must register an on_unload callback")
-                ctx.unload()
-
-                after = mod.nervous.report()
-                self.assertFalse(after["enabled"])
-                self.assertFalse(after["admission_enabled"])
-                self.assertEqual(after["active_turns"], 0)
-                self.assertFalse(mod.selective_context.report()["enabled"])
-                self.assertEqual(mod.gate.gate_mode(), "off")
-                self.assertFalse(mod.work_runtime.enabled())
-                self.assertFalse(mod.experience.enabled())
-                self.assertFalse(mod.ledger.enabled())
-                self.assertFalse(mod.receipts.enabled())
-
-                # Even if an in-flight turn held references to the old closures, they must be inert.
-                stale_outputs = [
-                    cb(
-                        session_id="ae56b4",
-                        turn_id="turn-after-unload",
-                        user_message="check plugin-unload-architecture sticky memory hooks",
+                    # Seed an admitted verified-experience claim so memory_context emits [Nerve selected memory].
+                    store = mod.experience.default_store()
+                    claim = store.create_claim(
+                        subject="plugin-unload-architecture",
+                        statement="Plugin disable must detach sticky pre_llm_call memory hooks immediately.",
+                        claim_type="verified",
+                        evidence_ids=["ev-unload-1"],
+                        confidence=0.95,
+                        admit=True,
                     )
-                    for cb in pre_llm_cbs
-                ]
-                self.assertEqual([x for x in stale_outputs if x is not None], [])
-                self.assertIsNone(
-                    pre_tool_cbs[0](tool_name="terminal", args={"command": "echo hi"}, session_id="ae56b4", turn_id="turn-after-unload")
-                )
-                self.assertIsNone(
-                    mw_cbs[0](
-                        request={"messages": [{"role": "user", "content": "check plugin-unload-architecture"}]},
-                        session_id="ae56b4",
-                        turn_id="turn-after-unload",
-                    )
-                )
+                    self.assertTrue(claim["admitted"])
 
-                # Re-registering (re-enable / hot-reload) cleanly restores Nerve supervision.
-                ctx2 = UnloadableHostCtx(
-                    home,
-                    {
-                        "nerve_profile": "fat_cat",
-                        "nervous_enabled": True,
-                        "nervous_turn_admission": True,
-                        "nervous_emit_prompt_hint": True,
-                        "selective_context_enabled": True,
-                        "selective_context_memory_mode": "apply",
-                    },
-                )
-                mod.register(ctx2)
-                try:
-                    reloaded = mod.nervous.report()
-                    self.assertTrue(reloaded["enabled"])
-                    self.assertTrue(reloaded["admission_enabled"])
-                    re_outputs = [
+                    before = mod.nervous.report()
+                    self.assertTrue(before["enabled"])
+                    self.assertTrue(before["admission_enabled"])
+                    self.assertTrue(mod.selective_context.report()["enabled"])
+                    self.assertEqual(mod.gate.gate_mode(), "advisory")
+                    self.assertTrue(mod.work_runtime.enabled())
+
+                    pre_llm_cbs = [cb for name, cb in ctx.hooks if name == "pre_llm_call"]
+                    pre_tool_cbs = [cb for name, cb in ctx.hooks if name == "pre_tool_call"]
+                    mw_cbs = [cb for kind, cb in ctx.middleware if kind == "llm_request"]
+                    self.assertGreaterEqual(len(pre_llm_cbs), 2)
+                    self.assertEqual(len(pre_tool_cbs), 1)
+                    self.assertEqual(len(mw_cbs), 1)
+
+                    outputs = [
                         cb(
                             session_id="ae56b4",
-                            turn_id="turn-reloaded",
+                            turn_id="turn-before-unload",
                             user_message="check plugin-unload-architecture sticky memory hooks",
                         )
-                        for name, cb in ctx2.hooks
-                        if name == "pre_llm_call"
+                        for cb in pre_llm_cbs
                     ]
-                    re_rendered = "\n".join(
+                    rendered = "\n".join(
                         item["context"] if isinstance(item, dict) else str(item)
-                        for item in re_outputs
+                        for item in outputs
                         if item is not None
                     )
-                    self.assertIn("[Nerve selected memory", re_rendered)
-                finally:
-                    ctx2.unload()
+                    self.assertIn("[Nerve selected memory", rendered)
+                    self.assertIn("Nerve nervous supervision is active", rendered)
+                    self.assertEqual(mod.nervous.report()["active_turns"], 1)
+
+                    # Unload plugin: must register on_unload and tear down all live Nerve state.
+                    self.assertTrue(ctx._unload_callbacks, "register(ctx) must register an on_unload callback")
+                    ctx.unload()
+
+                    after = mod.nervous.report()
+                    self.assertFalse(after["enabled"])
+                    self.assertFalse(after["admission_enabled"])
+                    self.assertEqual(after["active_turns"], 0)
+                    self.assertFalse(mod.selective_context.report()["enabled"])
+                    self.assertEqual(mod.gate.gate_mode(), "off")
+                    self.assertFalse(mod.work_runtime.enabled())
+                    self.assertFalse(mod.experience.enabled())
+                    self.assertFalse(mod.ledger.enabled())
+                    self.assertFalse(mod.receipts.enabled())
+
+                    # Even if an in-flight turn held references to the old closures, they must be inert.
+                    stale_outputs = [
+                        cb(
+                            session_id="ae56b4",
+                            turn_id="turn-after-unload",
+                            user_message="check plugin-unload-architecture sticky memory hooks",
+                        )
+                        for cb in pre_llm_cbs
+                    ]
+                    self.assertEqual([x for x in stale_outputs if x is not None], [])
+                    self.assertIsNone(
+                        pre_tool_cbs[0](tool_name="terminal", args={"command": "echo hi"}, session_id="ae56b4", turn_id="turn-after-unload")
+                    )
+                    self.assertIsNone(
+                        mw_cbs[0](
+                            request={"messages": [{"role": "user", "content": "check plugin-unload-architecture"}]},
+                            session_id="ae56b4",
+                            turn_id="turn-after-unload",
+                        )
+                    )
+
+                    # Re-registering (re-enable / hot-reload) cleanly restores Nerve supervision.
+                    ctx2 = UnloadableHostCtx(
+                        home,
+                        {
+                            "nerve_profile": "fat_cat",
+                            "nervous_enabled": True,
+                            "nervous_turn_admission": True,
+                            "nervous_emit_prompt_hint": True,
+                            "selective_context_enabled": True,
+                            "selective_context_memory_mode": "apply",
+                        },
+                    )
+                    mod.register(ctx2)
+                    try:
+                        reloaded = mod.nervous.report()
+                        self.assertTrue(reloaded["enabled"])
+                        self.assertTrue(reloaded["admission_enabled"])
+                        re_outputs = [
+                            cb(
+                                session_id="ae56b4",
+                                turn_id="turn-reloaded",
+                                user_message="check plugin-unload-architecture sticky memory hooks",
+                            )
+                            for name, cb in ctx2.hooks
+                            if name == "pre_llm_call"
+                        ]
+                        re_rendered = "\n".join(
+                            item["context"] if isinstance(item, dict) else str(item)
+                            for item in re_outputs
+                            if item is not None
+                        )
+                        self.assertIn("[Nerve selected memory", re_rendered)
+                    finally:
+                        ctx2.unload()
 
     def test_legacy_profile_unload_disables_nervous_and_clears_active_controls(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             with patch.dict(os.environ, self._isolated_env(td), clear=False):
                 mod = _load_fresh_plugin("nerve_unload_legacy")
-                system = mod.nervous.NervousSystem(
+                with mod.nervous.NervousSystem(
                     engine_factory=lambda: (_ for _ in ()).throw(RuntimeError("offline test"))
-                )
-                mod.nervous._default = system
-                ctx = UnloadableHostCtx(
-                    home,
-                    {
-                        "nerve_profile": "legacy",
-                        "gate_mode": "enforce",
-                        "nervous_enabled": True,
-                        "nervous_turn_admission": True,
-                        "nervous_emit_prompt_hint": True,
-                    },
-                )
-                mod.register(ctx)
-                self.assertTrue(mod.nervous.report()["enabled"])
-                self.assertTrue(mod.nervous.report()["admission_enabled"])
+                ) as system:
+                    mod.nervous._default = system
+                    ctx = UnloadableHostCtx(
+                        home,
+                        {
+                            "nerve_profile": "legacy",
+                            "gate_mode": "enforce",
+                            "nervous_enabled": True,
+                            "nervous_turn_admission": True,
+                            "nervous_emit_prompt_hint": True,
+                        },
+                    )
+                    mod.register(ctx)
+                    self.assertTrue(mod.nervous.report()["enabled"])
+                    self.assertTrue(mod.nervous.report()["admission_enabled"])
 
-                system.start_turn(user_message="fix app.py and run pytest", session_id="c28c44", turn_id="t-leg")
-                system.observe_tool_call(
-                    tool_name="read_file",
-                    args={"path": "missing.py"},
-                    status="error",
-                    error_message="file not found: missing.py",
-                    session_id="c28c44",
-                    turn_id="t-leg",
-                    tool_call_id="call-1",
-                )
-                self.assertEqual(mod.nervous.report()["active_turns"], 1)
-
-                ctx.unload()
-
-                after = mod.nervous.report()
-                self.assertFalse(after["enabled"])
-                self.assertFalse(after["admission_enabled"])
-                self.assertEqual(after["active_turns"], 0)
-                self.assertEqual(mod.gate.gate_mode(), "off")
-                self.assertIsNone(
-                    system.before_tool_call(
+                    system.start_turn(user_message="fix app.py and run pytest", session_id="c28c44", turn_id="t-leg")
+                    system.observe_tool_call(
                         tool_name="read_file",
                         args={"path": "missing.py"},
+                        status="error",
+                        error_message="file not found: missing.py",
                         session_id="c28c44",
                         turn_id="t-leg",
-                        tool_call_id="call-2",
+                        tool_call_id="call-1",
                     )
-                )
-                self.assertIsNone(system.inject_challenge("ok", turn_id="t-leg", session_id="c28c44"))
-                self.assertIsNone(system.completion_gate(turn_id="t-leg", session_id="c28c44", coding=True, changed_paths=[]))
+                    self.assertEqual(mod.nervous.report()["active_turns"], 1)
+
+                    ctx.unload()
+
+                    after = mod.nervous.report()
+                    self.assertFalse(after["enabled"])
+                    self.assertFalse(after["admission_enabled"])
+                    self.assertEqual(after["active_turns"], 0)
+                    self.assertEqual(mod.gate.gate_mode(), "off")
+                    self.assertIsNone(
+                        system.before_tool_call(
+                            tool_name="read_file",
+                            args={"path": "missing.py"},
+                            session_id="c28c44",
+                            turn_id="t-leg",
+                            tool_call_id="call-2",
+                        )
+                    )
+                    self.assertIsNone(system.inject_challenge("ok", turn_id="t-leg", session_id="c28c44"))
+                    self.assertIsNone(system.completion_gate(turn_id="t-leg", session_id="c28c44", coding=True, changed_paths=[]))
 
     def test_unload_deactivates_registered_context_engine_for_open_sessions(self):
         with tempfile.TemporaryDirectory() as td:
@@ -296,23 +296,27 @@ class PluginUnloadTests(unittest.TestCase):
                         "context_engine_mode": "apply",
                     },
                 )
-                mod.register(ctx)
-                engine = ctx.engine
-                self.assertIsNotNone(engine)
-                self.assertFalse(getattr(engine, "_unloaded", False))
+                try:
+                    mod.register(ctx)
+                    engine = ctx.engine
+                    self.assertIsNotNone(engine)
+                    self.assertFalse(getattr(engine, "_unloaded", False))
 
-                ctx.unload()
-                self.assertTrue(getattr(engine, "_unloaded", False))
-                with patch.object(mod.context, "curate_context", side_effect=AssertionError("must not curate after unload")):
-                    msgs = [
-                        {"role": "system", "content": "sys"},
-                        {"role": "user", "content": "first"},
-                        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}]},
-                        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x" * 2000},
-                        {"role": "user", "content": "latest"},
-                    ]
-                    out = engine.compress(msgs, current_tokens=50000, force=True)
-                    self.assertEqual(out, msgs)
+                    ctx.unload()
+                    self.assertTrue(getattr(engine, "_unloaded", False))
+                    with patch.object(mod.context, "curate_context", side_effect=AssertionError("must not curate after unload")):
+                        msgs = [
+                            {"role": "system", "content": "sys"},
+                            {"role": "user", "content": "first"},
+                            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}]},
+                            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x" * 2000},
+                            {"role": "user", "content": "latest"},
+                        ]
+                        out = engine.compress(msgs, current_tokens=50000, force=True)
+                        self.assertEqual(out, msgs)
+                finally:
+                    mod.nervous._default.drain(timeout=2.0)
+                    mod.nervous.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
 
 
 if __name__ == "__main__":

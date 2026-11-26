@@ -73,12 +73,12 @@ class CostVisibilityTest(unittest.TestCase):
                 "latency_ms": 640.0,
                 "usage": {"input_tokens": 100, "output_tokens": 10},
             })
-            system = nervous.NervousSystem(engine_factory=lambda: None)
-            system._outcomes = store
-            q = system.quality_metrics()
-            self.assertIsNone(q["jev_provider_cost"])
-            self.assertIsNone(q["jev_provider_reported_cost"])
-            self.assertEqual(q["jev_provider_cost_missing_decisions"], 1)
+            with nervous.NervousSystem(engine_factory=lambda: None) as system:
+                system._outcomes = store
+                q = system.quality_metrics()
+                self.assertIsNone(q["jev_provider_cost"])
+                self.assertIsNone(q["jev_provider_reported_cost"])
+                self.assertEqual(q["jev_provider_cost_missing_decisions"], 1)
 
 
     def test_explicit_zero_cost_remains_zero(self):

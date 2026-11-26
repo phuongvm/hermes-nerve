@@ -320,3 +320,169 @@ def test_delayed_io_worker_writes_to_caller_captured_paths_not_later_env(tmp_pat
         release.set()
         experience.configure(enabled=False)
         system.shutdown()
+
+
+def test_context_manager_drains_and_joins_workers_before_tempdir_cleanup(monkeypatch):
+    import os
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    class SlowAdmissionEngine:
+        def decide(self, **_kwargs):
+            time.sleep(0.03)
+            return SimpleNamespace(
+                value="ON",
+                confidence=0.95,
+                probabilities={"OFF": 0.01, "WATCH": 0.04, "ON": 0.95},
+                request_id="req-cm",
+                latency_ms=30.0,
+            )
+
+    td_path = None
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        events_path, _outcomes_path, _policy_path, exp_path = _isolated_nervous_env(td_path, monkeypatch)
+        experience.configure(enabled=True)
+        try:
+            with nervous.NervousSystem(engine_factory=SlowAdmissionEngine) as system:
+                system.configure(enabled=True, admission_enabled=True, mode="correct_next", call_threshold=1.0)
+                system.start_turn(
+                    user_message="Fix parser.py and verify tests.",
+                    session_id="s-cm",
+                    turn_id="t-cm",
+                )
+                system.observe_tool_call(
+                    turn_id="t-cm",
+                    session_id="s-cm",
+                    tool_name="read_file",
+                    args={"path": "missing_cm.py"},
+                    tool_call_id="cm-1",
+                    status="error",
+                    result="file not found: missing_cm.py",
+                    error_message="file not found: missing_cm.py",
+                )
+                assert system._worker is not None and system._worker.is_alive()
+                assert system._io_worker is not None and system._io_worker.is_alive()
+
+            assert system._worker is None
+            assert system._io_worker is None
+            assert len(system._abandoned_io_workers) == 0
+            assert system.report()["enabled"] is False
+            assert system.report()["active_turns"] == 0
+            assert events_path.exists()
+            assert exp_path.exists()
+            rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            assert any(r.get("kind") == "turn_admission" for r in rows)
+            assert any(r.get("kind") == "accounting_receipt" and r.get("tool_call_id") == "cm-1" for r in rows)
+        finally:
+            experience.configure(enabled=False)
+
+    assert td_path is not None and not td_path.exists()
+    assert not os.path.exists(str(td_path))
+
+
+def test_parameterized_shutdown_returns_bool_halts_task_worker_first_and_reenables(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    _isolated_nervous_env(tmp_path, monkeypatch)
+    admission_started = threading.Event()
+    allow_admission_finish = threading.Event()
+
+    class GatedAdmissionEngine:
+        def decide(self, **_kwargs):
+            admission_started.set()
+            allow_admission_finish.wait(timeout=1.0)
+            return SimpleNamespace(
+                value="ON",
+                confidence=0.92,
+                probabilities={"OFF": 0.02, "WATCH": 0.06, "ON": 0.92},
+                request_id="req-gate",
+                latency_ms=25.0,
+            )
+
+    system = nervous.NervousSystem(engine_factory=GatedAdmissionEngine)
+    system.configure(enabled=True, admission_enabled=True, mode="correct_next", call_threshold=1.0)
+    system.start_turn(user_message="Implement change.", session_id="s-clean", turn_id="t-clean")
+    assert admission_started.wait(timeout=1.0)
+    system.observe_tool_call(
+        turn_id="t-clean",
+        session_id="s-clean",
+        tool_name="read_file",
+        args={"path": "README.md"},
+        tool_call_id="clean-1",
+        status="ok",
+        result="ok",
+    )
+
+    def release_soon():
+        time.sleep(0.03)
+        allow_admission_finish.set()
+
+    releaser = threading.Thread(target=release_soon, daemon=True)
+    releaser.start()
+
+    clean = system.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
+    assert clean is True
+    assert system._worker is None
+    assert system._io_worker is None
+    assert len(system._abandoned_io_workers) == 0
+    assert system.report()["enabled"] is False
+    assert system.report()["active_turns"] == 0
+
+    # Re-enabling an instance resets _stopping and starts fresh workers cleanly.
+    allow_admission_finish.set()
+    system.configure(enabled=True, admission_enabled=False)
+    try:
+        assert system._stopping is False
+        assert system._worker is not None and system._worker.is_alive()
+        assert system._io_worker is not None and system._io_worker.is_alive()
+    finally:
+        assert system.shutdown(flush_timeout=1.0, join_timeout=1.0, drop_pending=True) is True
+
+
+def test_default_and_parameterized_shutdown_return_false_when_io_worker_stalls(tmp_path, monkeypatch):
+    _isolated_nervous_env(tmp_path, monkeypatch)
+    system = nervous.NervousSystem(
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("No remote calls expected"))
+    )
+    system.configure(enabled=True, admission_enabled=False, mode="correct_next", call_threshold=1.0)
+    system.start_turn(user_message="Stall check.", session_id="s-false", turn_id="t-false")
+
+    real_append = jsonl.append_jsonl
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hung_append(path, record):
+        if threading.current_thread().name == "hermes-nerve-nervous-io":
+            entered.set()
+            release.wait(timeout=3.0)
+        return real_append(path, record)
+
+    monkeypatch.setattr(jsonl, "append_jsonl", hung_append)
+    monkeypatch.setattr(nervous, "append_jsonl", hung_append)
+
+    try:
+        system.observe_tool_call(
+            turn_id="t-false",
+            session_id="s-false",
+            tool_name="read_file",
+            args={"path": "a.txt"},
+            tool_call_id="f-1",
+            status="ok",
+            result="ok",
+        )
+        assert entered.wait(timeout=1.0)
+
+        started = time.monotonic()
+        clean = system.shutdown()
+        elapsed = time.monotonic() - started
+
+        assert clean is False
+        assert elapsed < 0.60
+        assert len(system._abandoned_io_workers) == 1
+        assert system.report()["enabled"] is False
+        assert system.report()["active_turns"] == 0
+    finally:
+        release.set()
+

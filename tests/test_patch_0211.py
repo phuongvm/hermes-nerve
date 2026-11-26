@@ -224,28 +224,28 @@ class Patch0211Tests(unittest.TestCase):
             "HERMES_NERVE_NERVOUS_EVENTS": str(Path(td) / "nervous.jsonl"),
             "HERMES_NERVE_OUTCOMES": str(Path(td) / "outcomes.jsonl"),
         }, clear=False):
-            system = nervous.NervousSystem(engine_factory=NoopNervousEngine)
-            system.configure(enabled=True, admission_enabled=False, mode="correct_next")
-            system.start_turn(user_message="verify candidates", session_id="s1", turn_id="t1")
-            result = system.observe_tool_call(
-                tool_name="nerve_assess",
-                args={"questions": {"bad": {"type": "choice"}}},
-                status="error",
-                error_message="choice question requires at least two criteria labels",
-                result="tool error",
-                tool_call_id="jev-call-1",
-                session_id="s1",
-                turn_id="t1",
-            )
-            self.assertFalse(result["forwarded"])
-            self.assertEqual(result["reason"], "nerve-internal")
-            self.assertEqual(NoopNervousEngine.calls, [])
-            metrics = system.report()["metrics"]
-            self.assertEqual(metrics.get("nerve_internal_seen"), 1)
-            self.assertEqual(metrics.get("nerve_internal_suppressed"), 1)
-            quality = system.quality_metrics()
-            self.assertEqual(quality["nerve_internal_events_suppressed"], 1)
-            self.assertNotIn("nerve_assess", quality["provider_calls_by_origin"])
+            with nervous.NervousSystem(engine_factory=NoopNervousEngine) as system:
+                system.configure(enabled=True, admission_enabled=False, mode="correct_next")
+                system.start_turn(user_message="verify candidates", session_id="s1", turn_id="t1")
+                result = system.observe_tool_call(
+                    tool_name="nerve_assess",
+                    args={"questions": {"bad": {"type": "choice"}}},
+                    status="error",
+                    error_message="choice question requires at least two criteria labels",
+                    result="tool error",
+                    tool_call_id="jev-call-1",
+                    session_id="s1",
+                    turn_id="t1",
+                )
+                self.assertFalse(result["forwarded"])
+                self.assertEqual(result["reason"], "nerve-internal")
+                self.assertEqual(NoopNervousEngine.calls, [])
+                metrics = system.report()["metrics"]
+                self.assertEqual(metrics.get("nerve_internal_seen"), 1)
+                self.assertEqual(metrics.get("nerve_internal_suppressed"), 1)
+                quality = system.quality_metrics()
+                self.assertEqual(quality["nerve_internal_events_suppressed"], 1)
+                self.assertNotIn("nerve_assess", quality["provider_calls_by_origin"])
 
     def test_valid_explicit_jev_call_does_not_self_amplify_after_post_tool_observation(self):
         direct_provider = CountingProvider()
@@ -260,16 +260,16 @@ class Patch0211Tests(unittest.TestCase):
                 questions={"safe": {"type": "choice", "instructions": "Classify candidate.", "criteria": {"SAFE": "yes", "KEEP": "no"}}},
             )
             self.assertEqual(direct_provider.calls, 1)
-            system = nervous.NervousSystem(engine_factory=NoopNervousEngine)
-            system.configure(enabled=True, admission_enabled=False)
-            system.start_turn(user_message="verify", session_id="s1", turn_id="t1")
-            observed = system.observe_tool_call(
-                tool_name="nerve_assess", args={}, status="success", result=json.dumps(result),
-                tool_call_id="jev-call-ok", session_id="s1", turn_id="t1",
-            )
-            self.assertFalse(observed["forwarded"])
-            self.assertEqual(direct_provider.calls, 1)
-            self.assertEqual(NoopNervousEngine.calls, [])
+            with nervous.NervousSystem(engine_factory=NoopNervousEngine) as system:
+                system.configure(enabled=True, admission_enabled=False)
+                system.start_turn(user_message="verify", session_id="s1", turn_id="t1")
+                observed = system.observe_tool_call(
+                    tool_name="nerve_assess", args={}, status="success", result=json.dumps(result),
+                    tool_call_id="jev-call-ok", session_id="s1", turn_id="t1",
+                )
+                self.assertFalse(observed["forwarded"])
+                self.assertEqual(direct_provider.calls, 1)
+                self.assertEqual(NoopNervousEngine.calls, [])
 
     def test_remote_decide_rank_assess_verify_are_receipt_backed(self):
         provider = CountingProvider()

@@ -163,6 +163,7 @@ _PREREQUISITE_CONFIG = (("prerequisite_max_operations", 128), ("prerequisite_max
 DEFAULT_IO_QUEUE_MAXSIZE = 64
 _MAX_ABANDONED_IO_WORKERS = 2
 _IO_STOP = object()
+_TASK_STOP = object()
 
 
 @dataclass(frozen=True)
@@ -357,7 +358,7 @@ class NervousSystem:
         self._assignment_progress: WeakKeyDictionary = WeakKeyDictionary()
         self._observation_seq: int = 0
         self._recent_receipts: deque[dict[str, Any]] = deque(maxlen=MAX_RETAINED_RECEIPTS)
-        self._tasks: queue.Queue[tuple[str, dict[str, Any], contextvars.Context]] = queue.Queue(maxsize=128)
+        self._tasks: queue.Queue[Any] = queue.Queue(maxsize=128)
         self._worker: threading.Thread | None = None
         self._stopping = False
         self._io_cond = threading.Condition(threading.Lock())
@@ -377,6 +378,13 @@ class NervousSystem:
         self._initialized_paths: set[Path] = set()
         self._historical_model = HistoricalOutcomeModel(self._outcomes, self._config.local_learning_min_samples)
         self._policy_memory: PolicyMemory | None = None
+
+    def __enter__(self) -> NervousSystem:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.drain(timeout=2.0)
+        self.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
 
     def prerequisite_limits(self, operations: int, seconds: int) -> tuple[int, int] | None:
         """Intersect the host ceilings and operator settings; do not reserve slots."""
@@ -401,6 +409,8 @@ class NervousSystem:
                     self._log("prerequisite_config_invalid", {"setting": key})
             if "enabled" in kwargs:
                 cfg.enabled = bool(kwargs["enabled"])
+            if cfg.enabled:
+                self._stopping = False
             if "admission_enabled" in kwargs:
                 cfg.admission_enabled = bool(kwargs["admission_enabled"])
             if "mode" in kwargs:
@@ -484,6 +494,8 @@ class NervousSystem:
 
     def _ensure_worker(self) -> None:
         with self._lock:
+            if not self._config.enabled:
+                return
             if self._worker and self._worker.is_alive():
                 self._stopping = False
                 return
@@ -491,18 +503,45 @@ class NervousSystem:
             self._worker = threading.Thread(target=self._run, name="hermes-nerve-nervous", daemon=True)
             self._worker.start()
 
-    def _stop_worker(self) -> None:
+    def _drain_task_stop_sentinels(self) -> None:
+        kept: list[Any] = []
+        while True:
+            try:
+                item = self._tasks.get_nowait()
+            except queue.Empty:
+                break
+            self._tasks.task_done()
+            if item is not _TASK_STOP:
+                kept.append(item)
+        for item in kept:
+            try:
+                self._tasks.put_nowait(item)
+            except queue.Full:
+                break
+
+    def _stop_worker(self, *, timeout: float = 0.5) -> None:
         with self._lock:
             self._stopping = True
             worker = self._worker
-        if worker and worker is not threading.current_thread():
-            worker.join(timeout=0.5)
+        if worker is None:
+            with self._lock:
+                self._drain_task_stop_sentinels()
+            return
+        try:
+            self._tasks.put_nowait(_TASK_STOP)
+        except queue.Full:
+            pass
+        if worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, float(timeout)))
         with self._lock:
-            if self._worker is worker and (worker is None or not worker.is_alive()):
+            if self._worker is worker and not worker.is_alive():
                 self._worker = None
+                self._drain_task_stop_sentinels()
 
     def _ensure_io_worker(self) -> None:
         with self._lock:
+            if not self._config.enabled or self._stopping:
+                return
             self._abandoned_io_workers[:] = [t for t in self._abandoned_io_workers if t.is_alive()]
             if self._io_worker and self._io_worker.is_alive():
                 return
@@ -577,11 +616,12 @@ class NervousSystem:
         """Offload persistence/experience I/O onto bounded daemon worker without blocking hooks."""
         with self._lock:
             enabled = self._config.enabled
+            io_alive = self._io_worker is not None and self._io_worker.is_alive()
             abandoned_full = (
-                (self._io_worker is None or not self._io_worker.is_alive())
+                not io_alive
                 and sum(1 for t in self._abandoned_io_workers if t.is_alive()) >= _MAX_ABANDONED_IO_WORKERS
             )
-        if abandoned_full:
+        if (not enabled and not io_alive) or abandoned_full:
             with self._lock:
                 self._metrics["io_queue_dropped"] += 1
                 self._metrics[f"io_queue_dropped_{kind}"] += 1
@@ -698,11 +738,24 @@ class NervousSystem:
                 self._io_cond.wait(timeout=remaining)
             return True
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self,
+        *,
+        flush_timeout: float = 0.05,
+        join_timeout: float = 0.2,
+        drop_pending: bool = True,
+    ) -> bool:
         """Disable live supervision, stop workers, and release active turn/control state on plugin unload."""
-        self.flush_io(timeout=0.05)
-        self._stop_io_worker(drop_pending=True, timeout=0.2)
-        self.configure(enabled=False, admission_enabled=False)
+        with self._lock:
+            self._abandoned_io_workers[:] = [t for t in self._abandoned_io_workers if t.is_alive()]
+            abandoned_before = set(self._abandoned_io_workers)
+            self._stopping = True
+            self._config.enabled = False
+            self._config.admission_enabled = False
+            self._policy_memory = None
+        self._stop_worker(timeout=join_timeout)
+        self.flush_io(timeout=flush_timeout)
+        self._stop_io_worker(drop_pending=drop_pending, timeout=join_timeout)
         while True:
             try:
                 self._tasks.get_nowait()
@@ -718,6 +771,11 @@ class NervousSystem:
                 state.finished = True
             self._turns.clear()
             self._session_turn.clear()
+            self._abandoned_io_workers[:] = [t for t in self._abandoned_io_workers if t.is_alive()]
+            worker_stopped = self._worker is None or not self._worker.is_alive()
+            io_worker_stopped = self._io_worker is None or not self._io_worker.is_alive()
+            newly_abandoned = any(t not in abandoned_before for t in self._abandoned_io_workers)
+        return worker_stopped and io_worker_stopped and not newly_abandoned
 
     def _enqueue_task(self, kind: str, payload: dict[str, Any]) -> bool:
         """Bound background work without ever blocking the serving hook."""
@@ -739,9 +797,15 @@ class NervousSystem:
     def _run(self) -> None:
         while not self._stopping:
             try:
-                kind, payload, task_ctx = self._tasks.get(timeout=0.25)
+                item = self._tasks.get(timeout=0.25)
             except queue.Empty:
                 continue
+            if item is _TASK_STOP:
+                self._tasks.task_done()
+                if self._stopping:
+                    break
+                continue
+            kind, payload, task_ctx = item
             try:
                 # Run under the caller's captured context so profile-scoped
                 # secrets (Hermes ContextVars) survive the thread hop (#35).
@@ -3220,8 +3284,17 @@ def configure(**kwargs: Any) -> None:
     _default.configure(**kwargs)
 
 
-def shutdown() -> None:
-    _default.shutdown()
+def shutdown(
+    *,
+    flush_timeout: float = 0.05,
+    join_timeout: float = 0.2,
+    drop_pending: bool = True,
+) -> bool:
+    return _default.shutdown(
+        flush_timeout=flush_timeout,
+        join_timeout=join_timeout,
+        drop_pending=drop_pending,
+    )
 
 
 def flush_io(timeout: float = 5.0) -> bool:

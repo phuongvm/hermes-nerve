@@ -142,12 +142,11 @@ def intent_system(tmp_path, monkeypatch):
     def forbidden_provider():
         raise AssertionError("No inference in contract tests")
 
-    system = nervous.NervousSystem(engine_factory=forbidden_provider)
-    system.configure(enabled=True, admission_enabled=False, call_threshold=1.0,
-                     local_learning=False, policy_memory_enabled=False)
-    monkeypatch.setattr(nervous, "_default", system)
-    yield system
-    system.configure(enabled=False)
+    with nervous.NervousSystem(engine_factory=forbidden_provider) as system:
+        system.configure(enabled=True, admission_enabled=False, call_threshold=1.0,
+                         local_learning=False, policy_memory_enabled=False)
+        monkeypatch.setattr(nervous, "_default", system)
+        yield system
 
 
 @pytest.mark.parametrize("goal,expected", [
@@ -395,12 +394,11 @@ def test_without_host_metadata_ordinary_guard_keeps_eleven_twelve_boundary(tmp_p
         provider_attempts.append(True)
         raise AssertionError("This offline test must not construct a provider")
 
-    system = nervous.NervousSystem(engine_factory=forbidden_provider)
-    system.configure(
-        enabled=True, admission_enabled=False, mode="correct_next",
-        call_threshold=1.0, local_learning=False, policy_memory_enabled=False,
-    )
-    try:
+    with nervous.NervousSystem(engine_factory=forbidden_provider) as system:
+        system.configure(
+            enabled=True, admission_enabled=False, mode="correct_next",
+            call_threshold=1.0, local_learning=False, policy_memory_enabled=False,
+        )
         system.start_turn(
             user_message=prompt,
             session_id="fixture-session", turn_id="fixture-turn",
@@ -428,6 +426,4 @@ def test_without_host_metadata_ordinary_guard_keeps_eleven_twelve_boundary(tmp_p
         assert denial is not None
         assert denial["action"] == "block"
         assert "task-relevant implementation" in denial["message"]
-    finally:
-        system.configure(enabled=False)
     assert provider_attempts == []

@@ -87,23 +87,30 @@ class RouterTests(unittest.TestCase):
 
 class NervousSystemTests(unittest.TestCase):
     def make_system(self, td):
-        system = nervous.NervousSystem(engine_factory=ScriptedEngine)
-        system.configure(enabled=True, admission_enabled=True, mode="correct_next", challenge_confidence=0.86, call_threshold=0.58)
-        self.env = patch.dict(os.environ, {"HERMES_NERVE_NERVOUS_EVENTS": str(Path(td) / "nervous.jsonl")}, clear=False)
+        self.env = patch.dict(
+            os.environ,
+            {
+                "HERMES_NERVE_NERVOUS_EVENTS": str(Path(td) / "nervous.jsonl"),
+                "HERMES_NERVE_OUTCOMES": str(Path(td) / "outcomes.jsonl"),
+            },
+            clear=False,
+        )
         self.env.start()
         self.addCleanup(self.env.stop)
+        system = nervous.NervousSystem(engine_factory=ScriptedEngine)
+        system.configure(enabled=True, admission_enabled=True, mode="correct_next", challenge_confidence=0.86, call_threshold=0.58)
         return system
 
     def test_off_admission_logs_but_suppresses_events(self):
         with tempfile.TemporaryDirectory() as td:
             ScriptedEngine.reset(FakeDecisionResult("OFF", 0.98, {"OFF": 0.98, "WATCH": 0.01, "ON": 0.01}))
-            system = self.make_system(td)
-            tid = system.start_turn(user_message="what's good", session_id="s1", turn_id="t1")
-            self.assertTrue(system.drain())
-            result = system.emit_event({"turn_id": tid, "type": "DECISION", "goal": "chat", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 1.0})
-            self.assertFalse(result["forwarded"])
-            self.assertEqual(system.status(turn_id=tid)["admission"], "OFF")
-            self.assertEqual(len(ScriptedEngine.calls), 1)
+            with self.make_system(td) as system:
+                tid = system.start_turn(user_message="what's good", session_id="s1", turn_id="t1")
+                self.assertTrue(system.drain())
+                result = system.emit_event({"turn_id": tid, "type": "DECISION", "goal": "chat", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 1.0})
+                self.assertFalse(result["forwarded"])
+                self.assertEqual(system.status(turn_id=tid)["admission"], "OFF")
+                self.assertEqual(len(ScriptedEngine.calls), 1)
 
     def test_watch_promotes_on_material_decision(self):
         with tempfile.TemporaryDirectory() as td:
@@ -111,20 +118,20 @@ class NervousSystemTests(unittest.TestCase):
                 FakeDecisionResult("WATCH", 0.90, {"OFF": 0.05, "WATCH": 0.90, "ON": 0.05}),
                 FakeDecisionResult("B", 0.94, {"A": 0.06, "B": 0.94}),
             )
-            system = self.make_system(td)
-            system.start_turn(user_message="take a look at why this is odd", session_id="s1", turn_id="t1")
-            self.assertTrue(system.drain())
-            emitted = system.emit_event({
-                "turn_id": "t1", "type": "STRATEGY_CHANGE", "goal": "fix issue",
-                "choices": ["A", "B"], "hermes_decision": "A", "materiality": 0.9,
-                "strategy_changed": True, "state_version": "v1",
-            })
-            self.assertTrue(emitted["forwarded"])
-            self.assertTrue(system.drain())
-            st = system.status(turn_id="t1")
-            self.assertEqual(st["admission"], "ON")
-            self.assertEqual(st["watch_promotions"], 1)
-            self.assertEqual(st["pending_challenges"], 1)
+            with self.make_system(td) as system:
+                system.start_turn(user_message="take a look at why this is odd", session_id="s1", turn_id="t1")
+                self.assertTrue(system.drain())
+                emitted = system.emit_event({
+                    "turn_id": "t1", "type": "STRATEGY_CHANGE", "goal": "fix issue",
+                    "choices": ["A", "B"], "hermes_decision": "A", "materiality": 0.9,
+                    "strategy_changed": True, "state_version": "v1",
+                })
+                self.assertTrue(emitted["forwarded"])
+                self.assertTrue(system.drain())
+                st = system.status(turn_id="t1")
+                self.assertEqual(st["admission"], "ON")
+                self.assertEqual(st["watch_promotions"], 1)
+                self.assertEqual(st["pending_challenges"], 1)
 
     def test_confident_disagreement_injected_into_next_tool_result(self):
         with tempfile.TemporaryDirectory() as td:
@@ -132,20 +139,20 @@ class NervousSystemTests(unittest.TestCase):
                 FakeDecisionResult("ON", 0.99, {"OFF": 0.0, "WATCH": 0.01, "ON": 0.99}),
                 FakeDecisionResult("ROLLBACK", 0.96, {"PATCH": 0.04, "ROLLBACK": 0.96}),
             )
-            system = self.make_system(td)
-            system.start_turn(user_message="fix and ship it", session_id="s1", turn_id="t1")
-            self.assertTrue(system.drain())
-            system.emit_event({
-                "turn_id": "t1", "type": "DECISION", "goal": "repair",
-                "choices": ["PATCH", "ROLLBACK"], "hermes_decision": "PATCH",
-                "materiality": 0.9, "state_version": "v1",
-            })
-            self.assertTrue(system.drain())
-            transformed = system.inject_challenge("tool output", turn_id="t1")
-            self.assertIsNotNone(transformed)
-            self.assertIn("JEV_DECISION_CHALLENGE", transformed)
-            self.assertIn("ROLLBACK", transformed)
-            self.assertEqual(system.status(turn_id="t1")["pending_challenges"], 0)
+            with self.make_system(td) as system:
+                system.start_turn(user_message="fix and ship it", session_id="s1", turn_id="t1")
+                self.assertTrue(system.drain())
+                system.emit_event({
+                    "turn_id": "t1", "type": "DECISION", "goal": "repair",
+                    "choices": ["PATCH", "ROLLBACK"], "hermes_decision": "PATCH",
+                    "materiality": 0.9, "state_version": "v1",
+                })
+                self.assertTrue(system.drain())
+                transformed = system.inject_challenge("tool output", turn_id="t1")
+                self.assertIsNotNone(transformed)
+                self.assertIn("JEV_DECISION_CHALLENGE", transformed)
+                self.assertIn("ROLLBACK", transformed)
+                self.assertEqual(system.status(turn_id="t1")["pending_challenges"], 0)
 
     def test_low_confidence_disagreement_is_silent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -153,12 +160,12 @@ class NervousSystemTests(unittest.TestCase):
                 FakeDecisionResult("ON", 0.99),
                 FakeDecisionResult("B", 0.60, {"A": 0.4, "B": 0.6}),
             )
-            system = self.make_system(td)
-            system.start_turn(user_message="fix it", session_id="s1", turn_id="t1")
-            self.assertTrue(system.drain())
-            system.emit_event({"turn_id": "t1", "type": "DECISION", "goal": "g", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 0.9})
-            self.assertTrue(system.drain())
-            self.assertIsNone(system.inject_challenge("x", turn_id="t1"))
+            with self.make_system(td) as system:
+                system.start_turn(user_message="fix it", session_id="s1", turn_id="t1")
+                self.assertTrue(system.drain())
+                system.emit_event({"turn_id": "t1", "type": "DECISION", "goal": "g", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 0.9})
+                self.assertTrue(system.drain())
+                self.assertIsNone(system.inject_challenge("x", turn_id="t1"))
 
     def test_stale_challenge_is_not_delivered(self):
         with tempfile.TemporaryDirectory() as td:
@@ -166,15 +173,15 @@ class NervousSystemTests(unittest.TestCase):
                 FakeDecisionResult("ON", 0.99),
                 FakeDecisionResult("B", 0.95, {"A": 0.05, "B": 0.95}),
             )
-            system = self.make_system(td)
-            system.start_turn(user_message="fix it", session_id="s1", turn_id="t1")
-            self.assertTrue(system.drain())
-            system.emit_event({"turn_id": "t1", "type": "DECISION", "goal": "g", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 0.9, "state_version": "v1"})
-            self.assertTrue(system.drain())
-            # A newer local event advances the state version before the old challenge can be injected.
-            system.emit_event({"turn_id": "t1", "type": "OBSERVATION", "goal": "g", "state_version": "v2"})
-            self.assertIsNone(system.inject_challenge("x", turn_id="t1"))
-            self.assertEqual(system.report()["metrics"].get("challenges_stale"), 1)
+            with self.make_system(td) as system:
+                system.start_turn(user_message="fix it", session_id="s1", turn_id="t1")
+                self.assertTrue(system.drain())
+                system.emit_event({"turn_id": "t1", "type": "DECISION", "goal": "g", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 0.9, "state_version": "v1"})
+                self.assertTrue(system.drain())
+                # A newer local event advances the state version before the old challenge can be injected.
+                system.emit_event({"turn_id": "t1", "type": "OBSERVATION", "goal": "g", "state_version": "v2"})
+                self.assertIsNone(system.inject_challenge("x", turn_id="t1"))
+                self.assertEqual(system.report()["metrics"].get("challenges_stale"), 1)
 
     def test_repeated_failure_dedup_and_local_loop_breaker_blocks_fourth_identical_action(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {
@@ -182,32 +189,32 @@ class NervousSystemTests(unittest.TestCase):
             "HERMES_NERVE_OUTCOMES": str(Path(td) / "outcomes.jsonl"),
         }, clear=False):
             ScriptedEngine.reset("CONTINUE")
-            system = nervous.NervousSystem(engine_factory=ScriptedEngine)
-            system.configure(enabled=True, admission_enabled=False, mode="correct_next", repeated_failure_local_replan_at=3)
-            system.start_turn(user_message="repair it", session_id="s1", turn_id="t1")
-            event = dict(
-                tool_name="terminal", args={"command": "python broken.py"}, status="error",
-                result="Traceback: connection failed after 501 ms", error_message="connection failed after 501 ms",
-                session_id="s1", turn_id="t1",
-            )
-            first = system.observe_tool_call(tool_call_id="c1", **event)
-            self.assertTrue(first["forwarded"])
-            self.assertTrue(system.drain())
-            second = system.observe_tool_call(tool_call_id="c2", **event)
-            third = system.observe_tool_call(tool_call_id="c3", **event)
-            self.assertFalse(second["forwarded"])
-            self.assertFalse(third["forwarded"])
-            self.assertEqual(len([c for c in ScriptedEngine.calls if c[0] == "assess"]), 1)
-            block = system.before_tool_call(
-                tool_name="terminal", args={"command": "python broken.py"},
-                session_id="s1", turn_id="t1", tool_call_id="c4",
-            )
-            self.assertEqual(block["action"], "block")
-            self.assertIn("prevents repeating the exact action", block["message"])
-            q = system.quality_metrics()
-            self.assertEqual(q["local_loop_breakers"], 1)
-            self.assertGreaterEqual(q["repeated_failure_provider_calls_avoided"], 2)
-            self.assertGreaterEqual(q["control_override_attempts"], 1)
+            with nervous.NervousSystem(engine_factory=ScriptedEngine) as system:
+                system.configure(enabled=True, admission_enabled=False, mode="correct_next", repeated_failure_local_replan_at=3)
+                system.start_turn(user_message="repair it", session_id="s1", turn_id="t1")
+                event = dict(
+                    tool_name="terminal", args={"command": "python broken.py"}, status="error",
+                    result="Traceback: connection failed after 501 ms", error_message="connection failed after 501 ms",
+                    session_id="s1", turn_id="t1",
+                )
+                first = system.observe_tool_call(tool_call_id="c1", **event)
+                self.assertTrue(first["forwarded"])
+                self.assertTrue(system.drain())
+                second = system.observe_tool_call(tool_call_id="c2", **event)
+                third = system.observe_tool_call(tool_call_id="c3", **event)
+                self.assertFalse(second["forwarded"])
+                self.assertFalse(third["forwarded"])
+                self.assertEqual(len([c for c in ScriptedEngine.calls if c[0] == "assess"]), 1)
+                block = system.before_tool_call(
+                    tool_name="terminal", args={"command": "python broken.py"},
+                    session_id="s1", turn_id="t1", tool_call_id="c4",
+                )
+                self.assertEqual(block["action"], "block")
+                self.assertIn("prevents repeating the exact action", block["message"])
+                q = system.quality_metrics()
+                self.assertEqual(q["local_loop_breakers"], 1)
+                self.assertGreaterEqual(q["repeated_failure_provider_calls_avoided"], 2)
+                self.assertGreaterEqual(q["control_override_attempts"], 1)
 
     def test_deterministic_policy_failure_replans_after_first_block_without_provider(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {
@@ -215,34 +222,34 @@ class NervousSystemTests(unittest.TestCase):
             "HERMES_NERVE_OUTCOMES": str(Path(td) / "outcomes.jsonl"),
         }, clear=False):
             ScriptedEngine.reset()
-            system = nervous.NervousSystem(engine_factory=ScriptedEngine)
-            system.configure(enabled=True, admission_enabled=False, mode="correct_next")
-            system.start_turn(user_message="recover from policy block", session_id="s1", turn_id="t1")
-            out = system.observe_tool_call(
-                tool_name="execute_code", args={"code": "print('x')"}, status="error",
-                result="BLOCKED: execute_code is not allowed in an unattended session; single-query mode requires approval",
-                error_message="", tool_call_id="c1", session_id="s1", turn_id="t1",
-            )
-            self.assertFalse(out["forwarded"])
-            self.assertIn("deterministic-failure-local-replan", out["router"]["reasons"])
-            state = system.status(turn_id="t1")
-            self.assertEqual(state["active_control"]["control"], "REPLAN")
-            self.assertEqual(state["active_control"]["source"], "local-deterministic-failure")
-            self.assertEqual(ScriptedEngine.calls, [])
-            transformed = system.inject_challenge("blocked", turn_id="t1")
-            self.assertIn("Do not repeat the same tool with the same arguments", transformed)
-            blocked = system.before_tool_call(
-                tool_name="execute_code", args={"code": "print('x')"},
-                session_id="s1", turn_id="t1", tool_call_id="c2",
-            )
-            self.assertEqual(blocked["action"], "block")
-            allowed = system.before_tool_call(
-                tool_name="read_file", args={"path": "README.md"},
-                session_id="s1", turn_id="t1", tool_call_id="c3",
-            )
-            self.assertIsNone(allowed)
-            self.assertIsNone(system.status(turn_id="t1")["active_control"])
-            self.assertEqual(system.quality_metrics()["deterministic_failure_replans"], 1)
+            with nervous.NervousSystem(engine_factory=ScriptedEngine) as system:
+                system.configure(enabled=True, admission_enabled=False, mode="correct_next")
+                system.start_turn(user_message="recover from policy block", session_id="s1", turn_id="t1")
+                out = system.observe_tool_call(
+                    tool_name="execute_code", args={"code": "print('x')"}, status="error",
+                    result="BLOCKED: execute_code is not allowed in an unattended session; single-query mode requires approval",
+                    error_message="", tool_call_id="c1", session_id="s1", turn_id="t1",
+                )
+                self.assertFalse(out["forwarded"])
+                self.assertIn("deterministic-failure-local-replan", out["router"]["reasons"])
+                state = system.status(turn_id="t1")
+                self.assertEqual(state["active_control"]["control"], "REPLAN")
+                self.assertEqual(state["active_control"]["source"], "local-deterministic-failure")
+                self.assertEqual(ScriptedEngine.calls, [])
+                transformed = system.inject_challenge("blocked", turn_id="t1")
+                self.assertIn("Do not repeat the same tool with the same arguments", transformed)
+                blocked = system.before_tool_call(
+                    tool_name="execute_code", args={"code": "print('x')"},
+                    session_id="s1", turn_id="t1", tool_call_id="c2",
+                )
+                self.assertEqual(blocked["action"], "block")
+                allowed = system.before_tool_call(
+                    tool_name="read_file", args={"path": "README.md"},
+                    session_id="s1", turn_id="t1", tool_call_id="c3",
+                )
+                self.assertIsNone(allowed)
+                self.assertIsNone(system.status(turn_id="t1")["active_control"])
+                self.assertEqual(system.quality_metrics()["deterministic_failure_replans"], 1)
 
     def test_deterministic_failure_classifier_boundary_matrix(self):
         deterministic = {
@@ -288,37 +295,37 @@ class NervousSystemTests(unittest.TestCase):
             "HERMES_NERVE_OUTCOMES": str(Path(td) / "outcomes.jsonl"),
         }, clear=False):
             ScriptedEngine.reset("REPLAN")
-            system = nervous.NervousSystem(engine_factory=ScriptedEngine)
-            system.configure(enabled=True, admission_enabled=False, mode="correct_next", challenge_confidence=0.86)
-            system.start_turn(user_message="repair it", session_id="s1", turn_id="t1")
-            out = system.observe_tool_call(
-                tool_name="terminal", args={"command": "python broken.py"}, status="error",
-                result="same failure", error_message="same failure", tool_call_id="c1",
-                session_id="s1", turn_id="t1",
-            )
-            self.assertTrue(out["forwarded"])
-            self.assertTrue(system.drain())
-            state = system.status(turn_id="t1")
-            self.assertEqual(state["active_control"]["control"], "REPLAN")
-            decision_id = state["active_control"]["decision_id"]
-            block = system.before_tool_call(
-                tool_name="terminal", args={"command": "python broken.py"},
-                session_id="s1", turn_id="t1", tool_call_id="c2",
-            )
-            self.assertEqual(block["action"], "block")
-            # A materially different diagnostic demonstrates the control affected trajectory.
-            allowed = system.before_tool_call(
-                tool_name="read_file", args={"path": "config.yaml"},
-                session_id="s1", turn_id="t1", tool_call_id="c3",
-            )
-            self.assertIsNone(allowed)
-            self.assertIsNone(system.status(turn_id="t1")["active_control"])
-            report = system._outcomes.report()
-            self.assertGreaterEqual(report["metrics"].get("controls_enforced", 0), 1)
-            self.assertGreaterEqual(report["metrics"].get("controls_followed", 0), 1)
-            self.assertGreaterEqual(report["control_attribution"]["control_decisions_with_next_action"], 1)
-            rows = system._outcomes.rows()
-            self.assertTrue(any(r.get("decision_id") == decision_id and r.get("stage") == "next_action" for r in rows))
+            with nervous.NervousSystem(engine_factory=ScriptedEngine) as system:
+                system.configure(enabled=True, admission_enabled=False, mode="correct_next", challenge_confidence=0.86)
+                system.start_turn(user_message="repair it", session_id="s1", turn_id="t1")
+                out = system.observe_tool_call(
+                    tool_name="terminal", args={"command": "python broken.py"}, status="error",
+                    result="same failure", error_message="same failure", tool_call_id="c1",
+                    session_id="s1", turn_id="t1",
+                )
+                self.assertTrue(out["forwarded"])
+                self.assertTrue(system.drain())
+                state = system.status(turn_id="t1")
+                self.assertEqual(state["active_control"]["control"], "REPLAN")
+                decision_id = state["active_control"]["decision_id"]
+                block = system.before_tool_call(
+                    tool_name="terminal", args={"command": "python broken.py"},
+                    session_id="s1", turn_id="t1", tool_call_id="c2",
+                )
+                self.assertEqual(block["action"], "block")
+                # A materially different diagnostic demonstrates the control affected trajectory.
+                allowed = system.before_tool_call(
+                    tool_name="read_file", args={"path": "config.yaml"},
+                    session_id="s1", turn_id="t1", tool_call_id="c3",
+                )
+                self.assertIsNone(allowed)
+                self.assertIsNone(system.status(turn_id="t1")["active_control"])
+                report = system._outcomes.report()
+                self.assertGreaterEqual(report["metrics"].get("controls_enforced", 0), 1)
+                self.assertGreaterEqual(report["metrics"].get("controls_followed", 0), 1)
+                self.assertGreaterEqual(report["control_attribution"]["control_decisions_with_next_action"], 1)
+                rows = system._outcomes.rows()
+                self.assertTrue(any(r.get("decision_id") == decision_id and r.get("stage") == "next_action" for r in rows))
 
     def test_remote_retry_explicitly_allows_one_identical_retry(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {
@@ -326,22 +333,22 @@ class NervousSystemTests(unittest.TestCase):
             "HERMES_NERVE_OUTCOMES": str(Path(td) / "outcomes.jsonl"),
         }, clear=False):
             ScriptedEngine.reset("RETRY")
-            system = nervous.NervousSystem(engine_factory=ScriptedEngine)
-            system.configure(enabled=True, admission_enabled=False, mode="correct_next")
-            system.start_turn(user_message="repair it", session_id="s1", turn_id="t1")
-            system.observe_tool_call(
-                tool_name="terminal", args={"command": "python broken.py"}, status="error",
-                result="temporary failure", error_message="temporary failure", tool_call_id="c1",
-                session_id="s1", turn_id="t1",
-            )
-            self.assertTrue(system.drain())
-            self.assertEqual(system.status(turn_id="t1")["active_control"]["control"], "RETRY")
-            allowed = system.before_tool_call(
-                tool_name="terminal", args={"command": "python broken.py"},
-                session_id="s1", turn_id="t1", tool_call_id="c2",
-            )
-            self.assertIsNone(allowed)
-            self.assertIsNone(system.status(turn_id="t1")["active_control"])
+            with nervous.NervousSystem(engine_factory=ScriptedEngine) as system:
+                system.configure(enabled=True, admission_enabled=False, mode="correct_next")
+                system.start_turn(user_message="repair it", session_id="s1", turn_id="t1")
+                system.observe_tool_call(
+                    tool_name="terminal", args={"command": "python broken.py"}, status="error",
+                    result="temporary failure", error_message="temporary failure", tool_call_id="c1",
+                    session_id="s1", turn_id="t1",
+                )
+                self.assertTrue(system.drain())
+                self.assertEqual(system.status(turn_id="t1")["active_control"]["control"], "RETRY")
+                allowed = system.before_tool_call(
+                    tool_name="terminal", args={"command": "python broken.py"},
+                    session_id="s1", turn_id="t1", tool_call_id="c2",
+                )
+                self.assertIsNone(allowed)
+                self.assertIsNone(system.status(turn_id="t1")["active_control"])
 
     def test_failure_fingerprint_normalizes_timing_noise(self):
         a = router.failure_fingerprint(
@@ -357,39 +364,39 @@ class NervousSystemTests(unittest.TestCase):
     def test_provider_budget_is_safety_valve_not_primary_router(self):
         with tempfile.TemporaryDirectory() as td:
             ScriptedEngine.reset(FakeDecisionResult("ON", 0.99), FakeDecisionResult("B", 0.99))
-            system = self.make_system(td)
-            system.configure(max_provider_calls_per_turn=1)
-            system.start_turn(user_message="fix it", session_id="s1", turn_id="t1")
-            self.assertTrue(system.drain())
-            out = system.emit_event({"turn_id": "t1", "type": "DECISION", "goal": "g", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 1.0})
-            self.assertFalse(out["forwarded"])
-            self.assertEqual(out["reason"], "provider-budget")
+            with self.make_system(td) as system:
+                system.configure(max_provider_calls_per_turn=1)
+                system.start_turn(user_message="fix it", session_id="s1", turn_id="t1")
+                self.assertTrue(system.drain())
+                out = system.emit_event({"turn_id": "t1", "type": "DECISION", "goal": "g", "choices": ["A", "B"], "hermes_decision": "A", "materiality": 1.0})
+                self.assertFalse(out["forwarded"])
+                self.assertEqual(out["reason"], "provider-budget")
 
     def test_finish_turn_evicts_state_and_preserves_newer_session_mapping(self):
         with tempfile.TemporaryDirectory() as td:
-            system = self.make_system(td)
-            system.configure(admission_enabled=False)
-            system.start_turn(user_message="first", session_id="s1", turn_id="t1")
-            system.start_turn(user_message="second", session_id="s1", turn_id="t2")
-            system.finish_turn(turn_id="t1", assistant_response="done first")
-            self.assertNotIn("t1", system._turns)
-            self.assertEqual(system._session_turn.get("s1"), "t2")
-            system.finish_turn(turn_id="t2", assistant_response="done second")
-            self.assertNotIn("t2", system._turns)
-            self.assertNotIn("s1", system._session_turn)
-            self.assertEqual(system.report()["active_turns"], 0)
-            self.assertEqual(system.report()["metrics"]["turns_evicted"], 2)
+            with self.make_system(td) as system:
+                system.configure(admission_enabled=False)
+                system.start_turn(user_message="first", session_id="s1", turn_id="t1")
+                system.start_turn(user_message="second", session_id="s1", turn_id="t2")
+                system.finish_turn(turn_id="t1", assistant_response="done first")
+                self.assertNotIn("t1", system._turns)
+                self.assertEqual(system._session_turn.get("s1"), "t2")
+                system.finish_turn(turn_id="t2", assistant_response="done second")
+                self.assertNotIn("t2", system._turns)
+                self.assertNotIn("s1", system._session_turn)
+                self.assertEqual(system.report()["active_turns"], 0)
+                self.assertEqual(system.report()["metrics"]["turns_evicted"], 2)
 
     def test_late_admission_after_finished_turn_is_ignored(self):
         with tempfile.TemporaryDirectory() as td:
             ScriptedEngine.reset()
-            system = self.make_system(td)
-            system.configure(admission_enabled=False)
-            system.start_turn(user_message="work", session_id="s1", turn_id="t1")
-            system.finish_turn(turn_id="t1", assistant_response="done")
-            system._do_admission({"turn_id": "t1", "user_message": "work"})
-            self.assertEqual(ScriptedEngine.calls, [])
-            self.assertEqual(system.status(turn_id="t1"), {"active": False})
+            with self.make_system(td) as system:
+                system.configure(admission_enabled=False)
+                system.start_turn(user_message="work", session_id="s1", turn_id="t1")
+                system.finish_turn(turn_id="t1", assistant_response="done")
+                system._do_admission({"turn_id": "t1", "user_message": "work"})
+                self.assertEqual(ScriptedEngine.calls, [])
+                self.assertEqual(system.status(turn_id="t1"), {"active": False})
 
 
 if __name__ == "__main__":
@@ -430,28 +437,29 @@ class AsyncInvariantTests(unittest.TestCase):
                 time.sleep(0.25)
                 return FakeDecisionResult("OFF", 0.99)
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"HERMES_NERVE_NERVOUS_EVENTS": str(Path(td) / "n.jsonl")}, clear=False):
-            system = nervous.NervousSystem(engine_factory=SlowEngine)
-            system.configure(enabled=True, admission_enabled=True)
-            started = time.monotonic()
-            system.start_turn(user_message="hello", session_id="s", turn_id="t")
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 0.08)
-            self.assertTrue(system.drain(timeout=2.0))
-            self.assertEqual(system.status(turn_id="t")["admission"], "OFF")
+            with nervous.NervousSystem(engine_factory=SlowEngine) as system:
+                system.configure(enabled=True, admission_enabled=True)
+                started = time.monotonic()
+                system.start_turn(user_message="hello", session_id="s", turn_id="t")
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 0.08)
+                self.assertTrue(system.drain(timeout=2.0))
+                self.assertEqual(system.status(turn_id="t")["admission"], "OFF")
 
     def test_material_events_batch_behind_inflight_assessment(self):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"HERMES_NERVE_NERVOUS_EVENTS": str(Path(td) / "n.jsonl")}, clear=False):
-            system = nervous.NervousSystem(engine_factory=ScriptedEngine)
-            system.configure(enabled=True, admission_enabled=False)
-            system.start_turn(user_message="do work", session_id="s", turn_id="t")
-            state = system._resolve_turn(turn_id="t")
-            state.assessment_inflight = True
-            out1 = system.emit_event({"turn_id": "t", "type": "STRATEGY_CHANGE", "goal": "g", "materiality": 1.0, "strategy_changed": True})
-            out2 = system.emit_event({"turn_id": "t", "type": "RECOVERY", "goal": "g", "materiality": 1.0})
-            self.assertEqual(out1["reason"], "batched-behind-inflight")
-            self.assertEqual(out2["reason"], "batched-behind-inflight")
-            self.assertEqual(system.status(turn_id="t")["pending_batch_events"], 2)
-            self.assertEqual(system.report()["metrics"].get("events_batched"), 2)
+            with nervous.NervousSystem(engine_factory=ScriptedEngine) as system:
+                system.configure(enabled=True, admission_enabled=False)
+                system.start_turn(user_message="do work", session_id="s", turn_id="t")
+                state = system._resolve_turn(turn_id="t")
+                state.assessment_inflight = True
+                out1 = system.emit_event({"turn_id": "t", "type": "STRATEGY_CHANGE", "goal": "g", "materiality": 1.0, "strategy_changed": True})
+                out2 = system.emit_event({"turn_id": "t", "type": "RECOVERY", "goal": "g", "materiality": 1.0})
+                self.assertEqual(out1["reason"], "batched-behind-inflight")
+                self.assertEqual(out2["reason"], "batched-behind-inflight")
+                self.assertEqual(system.status(turn_id="t")["pending_batch_events"], 2)
+                self.assertEqual(system.report()["metrics"].get("events_batched"), 2)
+                state.assessment_inflight = False
 
 class OutcomeLearningTests(unittest.TestCase):
     def test_outcome_report_tracks_false_pass_and_useful_disagreement(self):
@@ -523,132 +531,132 @@ class OutcomeLearningTests(unittest.TestCase):
             self.assertGreater(prob, 0.5)
 
     def test_assessment_state_payload_bounding_within_max_chars(self):
-        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)  # type: ignore[arg-type]
-        small_state = nervous.TurnState(
-            turn_id="t-small",
-            session_id="s-small",
-            user_message_hash="hash",
-            admission="ON",
-        )
-        small_event = {
-            "type": "TOOL_RESULT",
-            "event_id": "e-small",
-            "tool_name": "read_file",
-            "goal": "Read config",
-            "state": {"args": {"path": "config.yaml"}, "result_preview": "ok"},
-        }
-        unchanged = sys._assessment_state(small_state, small_event)
-        self.assertEqual(unchanged["event"], small_event)
-        self.assertLessEqual(
-            len(json.dumps(unchanged, separators=(",", ":"), default=str)),
-            nervous.MAX_ASSESSMENT_STATE_CHARS,
-        )
+        with nervous.NervousSystem(engine_factory=ScriptedEngine) as sys:  # type: ignore[arg-type]
+            small_state = nervous.TurnState(
+                turn_id="t-small",
+                session_id="s-small",
+                user_message_hash="hash",
+                admission="ON",
+            )
+            small_event = {
+                "type": "TOOL_RESULT",
+                "event_id": "e-small",
+                "tool_name": "read_file",
+                "goal": "Read config",
+                "state": {"args": {"path": "config.yaml"}, "result_preview": "ok"},
+            }
+            unchanged = sys._assessment_state(small_state, small_event)
+            self.assertEqual(unchanged["event"], small_event)
+            self.assertLessEqual(
+                len(json.dumps(unchanged, separators=(",", ":"), default=str)),
+                nervous.MAX_ASSESSMENT_STATE_CHARS,
+            )
 
-        huge_text = "A" * 20000
-        adversarial_cases = [
-            (
-                "bulk_result_and_direct_arg",
-                nervous.TurnState(turn_id="t-bound", session_id="s-bound", user_message_hash="hash", admission="ON"),
-                {
-                    "type": "TOOL_RESULT",
-                    "event_id": "e-huge",
-                    "tool_name": "search_files",
-                    "state": {
-                        "args": {"pattern": "needle", "bulk_content": huge_text},
-                        "result_preview": huge_text,
+            huge_text = "A" * 20000
+            adversarial_cases = [
+                (
+                    "bulk_result_and_direct_arg",
+                    nervous.TurnState(turn_id="t-bound", session_id="s-bound", user_message_hash="hash", admission="ON"),
+                    {
+                        "type": "TOOL_RESULT",
+                        "event_id": "e-huge",
+                        "tool_name": "search_files",
+                        "state": {
+                            "args": {"pattern": "needle", "bulk_content": huge_text},
+                            "result_preview": huge_text,
+                        },
                     },
-                },
-            ),
-            (
-                "top_level_goal_and_many_custom_keys",
-                nervous.TurnState(turn_id="t-goal", session_id="s-goal", user_message_hash="hash", admission="ON"),
-                {
-                    "type": "DECISION",
-                    "event_id": "e-goal",
-                    "goal": "X" * 20000,
-                    "strategy": "Y" * 20000,
-                    "hypothesis": "Z" * 20000,
-                    "choices": ["C" * 5000 for _ in range(30)],
-                    **{f"custom_{i}": "V" * 5000 for i in range(40)},
-                    "state": {"args": {"nested_list": [["N" * 5000 for _ in range(25)]]}},
-                },
-            ),
-            (
-                "oversized_recent_event_type_and_episode",
-                self._make_oversized_turn_state(),
-                {
-                    "type": "FAILURE",
-                    "event_id": "e-fail",
-                    "failure_fingerprint": "fp-huge",
-                    "goal": "G" * 15000,
-                    "state": {"error": "E" * 15000, "result_preview": "R" * 15000},
-                },
-            ),
-            (
-                "oversized_batch_events",
-                nervous.TurnState(turn_id="t-batch", session_id="s-batch", user_message_hash="hash", admission="ON"),
-                {
-                    "type": "BATCH",
-                    "event_id": "e-batch",
-                    "goal": "B" * 12000,
-                    "state": {
-                        "batched_event_count": 20,
-                        "event_types": ["T" * 1000 for _ in range(20)],
-                        "events": [
-                            {"type": "TOOL_RESULT", "event_id": f"b-{i}", "goal": "G" * 4000, "state": {"out": "O" * 4000}}
-                            for i in range(20)
-                        ],
+                ),
+                (
+                    "top_level_goal_and_many_custom_keys",
+                    nervous.TurnState(turn_id="t-goal", session_id="s-goal", user_message_hash="hash", admission="ON"),
+                    {
+                        "type": "DECISION",
+                        "event_id": "e-goal",
+                        "goal": "X" * 20000,
+                        "strategy": "Y" * 20000,
+                        "hypothesis": "Z" * 20000,
+                        "choices": ["C" * 5000 for _ in range(30)],
+                        **{f"custom_{i}": "V" * 5000 for i in range(40)},
+                        "state": {"args": {"nested_list": [["N" * 5000 for _ in range(25)]]}},
                     },
-                },
-            ),
-            (
-                "non_dict_state_and_unicode",
-                nervous.TurnState(turn_id="t-uni", session_id="s-uni", user_message_hash="hash", admission="ON"),
-                {
-                    "type": "OBSERVATION",
-                    "event_id": "e-uni",
-                    "state": "🔥" * 15000,
-                },
-            ),
-            (
-                "oversized_numeric_counters_3001_digits",
-                self._make_oversized_numeric_turn_state(10**3000),
-                {
-                    "type": "FAILURE",
-                    "event_id": "e-num-3000",
-                    "failure_fingerprint": "fp-num",
-                    "failure_repeat_count": 10**3000,
-                    "goal": "G" * 9000,
-                    "state": {
-                        "args": {"big_int": 10**3000, "neg_big_int": -(10**3000), "big_float": 1e300, "inf": float("inf")},
-                        "result_preview": "R" * 4000,
+                ),
+                (
+                    "oversized_recent_event_type_and_episode",
+                    self._make_oversized_turn_state(),
+                    {
+                        "type": "FAILURE",
+                        "event_id": "e-fail",
+                        "failure_fingerprint": "fp-huge",
+                        "goal": "G" * 15000,
+                        "state": {"error": "E" * 15000, "result_preview": "R" * 15000},
                     },
-                },
-            ),
-            (
-                "oversized_numeric_counters_6001_digits_above_int_str_limit",
-                self._make_oversized_numeric_turn_state(10**6000),
-                {
-                    "type": "FAILURE",
-                    "event_id": "e-num-6000",
-                    "failure_fingerprint": "fp-num",
-                    "failure_repeat_count": 10**6000,
-                    "state": {"args": {"huge_int": 10**6000}},
-                },
-            ),
-        ]
+                ),
+                (
+                    "oversized_batch_events",
+                    nervous.TurnState(turn_id="t-batch", session_id="s-batch", user_message_hash="hash", admission="ON"),
+                    {
+                        "type": "BATCH",
+                        "event_id": "e-batch",
+                        "goal": "B" * 12000,
+                        "state": {
+                            "batched_event_count": 20,
+                            "event_types": ["T" * 1000 for _ in range(20)],
+                            "events": [
+                                {"type": "TOOL_RESULT", "event_id": f"b-{i}", "goal": "G" * 4000, "state": {"out": "O" * 4000}}
+                                for i in range(20)
+                            ],
+                        },
+                    },
+                ),
+                (
+                    "non_dict_state_and_unicode",
+                    nervous.TurnState(turn_id="t-uni", session_id="s-uni", user_message_hash="hash", admission="ON"),
+                    {
+                        "type": "OBSERVATION",
+                        "event_id": "e-uni",
+                        "state": "🔥" * 15000,
+                    },
+                ),
+                (
+                    "oversized_numeric_counters_3001_digits",
+                    self._make_oversized_numeric_turn_state(10**3000),
+                    {
+                        "type": "FAILURE",
+                        "event_id": "e-num-3000",
+                        "failure_fingerprint": "fp-num",
+                        "failure_repeat_count": 10**3000,
+                        "goal": "G" * 9000,
+                        "state": {
+                            "args": {"big_int": 10**3000, "neg_big_int": -(10**3000), "big_float": 1e300, "inf": float("inf")},
+                            "result_preview": "R" * 4000,
+                        },
+                    },
+                ),
+                (
+                    "oversized_numeric_counters_6001_digits_above_int_str_limit",
+                    self._make_oversized_numeric_turn_state(10**6000),
+                    {
+                        "type": "FAILURE",
+                        "event_id": "e-num-6000",
+                        "failure_fingerprint": "fp-num",
+                        "failure_repeat_count": 10**6000,
+                        "state": {"args": {"huge_int": 10**6000}},
+                    },
+                ),
+            ]
 
-        for label, turn_state, ev in adversarial_cases:
-            with self.subTest(case=label):
-                bounded = sys._assessment_state(turn_state, ev)
-                raw_ascii = json.dumps(bounded, separators=(",", ":"), default=str)
-                raw_utf8 = json.dumps(bounded, separators=(",", ":"), ensure_ascii=False, default=str)
-                self.assertLessEqual(len(raw_ascii), nervous.MAX_ASSESSMENT_STATE_CHARS, f"{label} exceeded ASCII bound")
-                self.assertLessEqual(len(raw_utf8), nervous.MAX_ASSESSMENT_STATE_CHARS, f"{label} exceeded UTF-8 bound")
-                self.assertIn("turn", bounded)
-                self.assertIn("event", bounded)
-                self.assertIn("recent_event_types", bounded)
-                self._assert_scalars_bounded(bounded)
+            for label, turn_state, ev in adversarial_cases:
+                with self.subTest(case=label):
+                    bounded = sys._assessment_state(turn_state, ev)
+                    raw_ascii = json.dumps(bounded, separators=(",", ":"), default=str)
+                    raw_utf8 = json.dumps(bounded, separators=(",", ":"), ensure_ascii=False, default=str)
+                    self.assertLessEqual(len(raw_ascii), nervous.MAX_ASSESSMENT_STATE_CHARS, f"{label} exceeded ASCII bound")
+                    self.assertLessEqual(len(raw_utf8), nervous.MAX_ASSESSMENT_STATE_CHARS, f"{label} exceeded UTF-8 bound")
+                    self.assertIn("turn", bounded)
+                    self.assertIn("event", bounded)
+                    self.assertIn("recent_event_types", bounded)
+                    self._assert_scalars_bounded(bounded)
 
     def _assert_scalars_bounded(self, node: object) -> None:
         if isinstance(node, dict):
@@ -705,9 +713,9 @@ class OutcomeLearningTests(unittest.TestCase):
         from hermes_nerve.reflex.openjev import OpenJevCircuitOpenError
 
         ScriptedEngine.reset(OpenJevCircuitOpenError("OpenJev circuit breaker is OPEN (3 consecutive timeouts; 58.0s cooldown remaining)"))
-        sys = nervous.NervousSystem(engine_factory=ScriptedEngine)  # type: ignore[arg-type]
         with tempfile.TemporaryDirectory() as td:
-            with patch.object(sys, "_log_path", return_value=Path(td) / "events.jsonl"):
+            sys = nervous.NervousSystem(engine_factory=ScriptedEngine)  # type: ignore[arg-type]
+            with patch.object(sys, "_log_path", return_value=Path(td) / "events.jsonl"), sys:
                 tid = sys.start_turn(user_message="Implement feature", session_id="s1")
                 payload = {
                     "turn_id": tid,

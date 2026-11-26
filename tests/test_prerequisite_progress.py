@@ -16,9 +16,9 @@ from hermes_nerve.nervous import NervousSystem
     ({"prerequisite_max_operations": 1, "prerequisite_max_seconds": 900}, (128, 1), (1, 1)),
 ])
 def test_prerequisite_limits_take_lower_bound(operator, host, expected):
-    system = NervousSystem()
-    system.configure(**operator)
-    assert system.prerequisite_limits(*host) == expected
+    with NervousSystem() as system:
+        system.configure(**operator)
+        assert system.prerequisite_limits(*host) == expected
 
 
 @pytest.mark.parametrize("key, value", [
@@ -39,10 +39,9 @@ def test_invalid_prerequisite_config_disables_only_allowance(key, value, tmp_pat
         provider_attempts.append(True)
         raise AssertionError("No inference in prerequisite limits tests")
 
-    system = NervousSystem(engine_factory=forbidden_provider)
-    system.configure(enabled=True, admission_enabled=False, mode="correct_next", call_threshold=1.0,
-                     local_learning=False, policy_memory_enabled=False, **{key: value})
-    try:
+    with NervousSystem(engine_factory=forbidden_provider) as system:
+        system.configure(enabled=True, admission_enabled=False, mode="correct_next", call_threshold=1.0,
+                         local_learning=False, policy_memory_enabled=False, **{key: value})
         assert system.prerequisite_limits(64, 600) is None
         assert system.report()["enabled"] is True
         system.start_turn(user_message="Implement the fix in src/parser.py.", session_id="actor", turn_id="turn")
@@ -53,8 +52,6 @@ def test_invalid_prerequisite_config_disables_only_allowance(key, value, tmp_pat
         decision = system.before_tool_call(tool_name="read_file", args=args, turn_id="turn")
         assert decision is not None and decision["action"] == "block"
         assert "task-relevant implementation" in decision["message"]
-    finally:
-        system.configure(enabled=False)
     assert not provider_attempts
     data = events.read_text(encoding="utf-8")
     assert "must-not-echo" not in data
@@ -64,7 +61,8 @@ def test_invalid_prerequisite_config_disables_only_allowance(key, value, tmp_pat
 
 @pytest.mark.parametrize("host", [(None, 1), (0, 1), (129, 900), (1, 901), (1, True)])
 def test_invalid_host_ceiling_is_not_given_defaults(host):
-    assert NervousSystem().prerequisite_limits(*host) is None
+    with NervousSystem() as system:
+        assert system.prerequisite_limits(*host) is None
 
 
 @pytest.mark.parametrize("profile, sidecar_limits, expected", [
@@ -94,18 +92,19 @@ def test_registration_resolves_prerequisite_ceilings(tmp_path, monkeypatch, prof
             "nervous_mode": "correct_next",
         }}, tmp_path)
     plugin = load_plugin()
-    system = NervousSystem()
-    monkeypatch.setattr(plugin.nervous, "_default", system)
-    plugin.register(Ctx(tmp_path, values))
+    with NervousSystem() as system:
+        monkeypatch.setattr(plugin.nervous, "_default", system)
+        plugin.register(Ctx(tmp_path, values))
 
-    assert system.prerequisite_limits(128, 900) == expected
-    assert system.report()["mode"] == ("shadow" if profile == "legacy" else "correct_next")
-    if expected is None:
-        data = events.read_text(encoding="utf-8")
-        assert "must-not-echo" not in data
-        assert any(row.get("kind") == "prerequisite_config_invalid"
-                   and row.get("setting") == "prerequisite_max_seconds"
-                   for row in map(json.loads, data.splitlines()))
+        assert system.prerequisite_limits(128, 900) == expected
+        assert system.report()["mode"] == ("shadow" if profile == "legacy" else "correct_next")
+        if expected is None:
+            assert system.drain(timeout=2.0)
+            data = events.read_text(encoding="utf-8")
+            assert "must-not-echo" not in data
+            assert any(row.get("kind") == "prerequisite_config_invalid"
+                       and row.get("setting") == "prerequisite_max_seconds"
+                       for row in map(json.loads, data.splitlines()))
 
 
 @pytest.mark.parametrize("case", ["valid", "invalid", "no-catalog", "read-only", "output"])
@@ -140,15 +139,14 @@ def test_native_hook_starts_preparation_once(tmp_path, monkeypatch, case):
         provider_attempts.append(True)
         raise AssertionError("No inference in prerequisite accounting tests")
 
-    system = NervousSystem(engine_factory=forbidden_provider)
-    monkeypatch.setattr(nervous, "_default", system)
-    system.configure(enabled=True, admission_enabled=False, call_threshold=1.0,
-                     local_learning=False, policy_memory_enabled=False,
-                     prerequisite_max_operations=1, prerequisite_max_seconds=0 if case == "invalid" else 10)
-    goal = "Summarize the report." if case == "read-only" else "Write proposal.md."
-    scope = dict(actor_session_id="actor", parent_session_id="parent", goal=goal, context=None)
-    args = {"path": str(planning / "rules/AGENTS.md")}
-    try:
+    with NervousSystem(engine_factory=forbidden_provider) as system:
+        monkeypatch.setattr(nervous, "_default", system)
+        system.configure(enabled=True, admission_enabled=False, call_threshold=1.0,
+                         local_learning=False, policy_memory_enabled=False,
+                         prerequisite_max_operations=1, prerequisite_max_seconds=0 if case == "invalid" else 10)
+        goal = "Summarize the report." if case == "read-only" else "Write proposal.md."
+        scope = dict(actor_session_id="actor", parent_session_id="parent", goal=goal, context=None)
+        args = {"path": str(planning / "rules/AGENTS.md")}
         with dc.native_task_intent(**scope) as intent:
             hook = dict(user_message=goal, session_id="actor", parent_session_id="parent", task_intent=intent)
             nervous.pre_llm_call(**hook, turn_id="initial")
@@ -171,8 +169,6 @@ def test_native_hook_starts_preparation_once(tmp_path, monkeypatch, case):
             assert system.status(turn_id="continued")["tool_actions"] == 1
             decision = reservations.reserve_read(intent, "actor", "page-2", "read_file", args)
             assert decision == {"valid": "exhausted", "output": "output"}.get(case, "unavailable")
-    finally:
-        system.configure(enabled=False)
     assert not provider_attempts
 
 
@@ -294,7 +290,8 @@ def test_accounting_receipts_capture_concurrent_completion_order_independent_of_
                     r, actor_session_id="actor", assignment_id=intent.assignment_id
                 ) is True
     finally:
-        system.configure(enabled=False)
+        system.drain(timeout=2.0)
+        system.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
 
 
 def test_accounting_receipts_reject_secret_and_source_content_leakage(tmp_path, monkeypatch):
@@ -347,12 +344,14 @@ def test_accounting_receipts_reject_secret_and_source_content_leakage(tmp_path, 
             receipts = system.accounting_receipts(session_id="actor", assignment_id=intent.assignment_id)
             assert len(receipts) >= 3
             serialized_receipts = json.dumps(receipts)
+            assert system.drain(timeout=2.0)
             disk_jsonl = events.read_text(encoding="utf-8")
             for forbidden in (secret_sk, secret_gh, secret_kv, source_sentinel):
                 assert forbidden not in serialized_receipts
                 assert forbidden not in disk_jsonl
     finally:
-        system.configure(enabled=False)
+        system.drain(timeout=2.0)
+        system.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
 
 
 def test_accounting_receipt_verification_rejects_replay_across_actor_or_assignment_and_tampering(
@@ -405,7 +404,8 @@ def test_accounting_receipt_verification_rejects_replay_across_actor_or_assignme
                 tampered, actor_session_id="actor-a", assignment_id=intent_a.assignment_id
             ) is False
     finally:
-        system.configure(enabled=False)
+        system.drain(timeout=2.0)
+        system.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
 
 
 def test_completion_gate_and_receipts_reject_scratch_unrelated_and_failed_writes_without_fake_progress(
@@ -532,7 +532,8 @@ def test_completion_gate_and_receipts_reject_scratch_unrelated_and_failed_writes
             assert r_done["output_verification"]["outputs_satisfied"] is True
             assert r_done["output_verification"]["verification_satisfied"] is True
     finally:
-        system.configure(enabled=False)
+        system.drain(timeout=2.0)
+        system.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
 
 
 def test_receipt_bookkeeping_failure_fails_closed_without_erasing_blocks(tmp_path, monkeypatch):
@@ -597,4 +598,5 @@ def test_receipt_bookkeeping_failure_fails_closed_without_erasing_blocks(tmp_pat
             )
             assert comp_block is not None and comp_block["action"] == "continue"
     finally:
-        system.configure(enabled=False)
+        system.drain(timeout=2.0)
+        system.shutdown(flush_timeout=2.0, join_timeout=2.0, drop_pending=True)
